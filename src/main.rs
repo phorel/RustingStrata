@@ -68,6 +68,10 @@ struct Engine {
     /// template's default.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     preserve_thinking: bool,
+    /// Let the model think before answering when a request does not say (`chat_template_kwargs.enable_thinking`).
+    /// Off by default.
+    #[arg(long)]
+    default_think: bool,
     /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from
     /// llama.cpp's default f16 cache).
     #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
@@ -1290,7 +1294,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             match serve::messages_body(&body).and_then(|b| serve::chat_request(&b)) {
                 Ok(req) => {
-                    let prompt = l.tpl.render(&req.messages, &req.tools, req.think, req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
+                    let prompt = l.tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.default_think), req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
                     send(&mut w, "200 OK", json!({"input_tokens": l.tok.encode(&prompt)?.len()}))
                 }
                 Err(err) => send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
@@ -1308,10 +1312,11 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             };
             // Room is checked on the full prompt before any state changes.
             let preserve = req.preserve_thinking.unwrap_or(e.preserve_thinking);
-            let prompt = tpl.render(&req.messages, &req.tools, req.think, preserve, true);
+            let think = req.think.unwrap_or(e.default_think);
+            let prompt = tpl.render(&req.messages, &req.tools, think, preserve, true);
             // The system and tools block, which compacted or rewritten conversations keep.
             let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
-            let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think, preserve, false);
+            let system = tpl.render(&req.messages[..n_sys], &req.tools, think, preserve, false);
             let ids = tok.encode(&prompt)?;
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
@@ -1346,7 +1351,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let res = (|| -> anyhow::Result<(Vec<u32>, bool)> {
                 let logits;
                 if serve::gone(&w) { anyhow::bail!("client closed the connection"); }
-                (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, req.think, preserve, false), &system)?;
+                (_, logits, cached) = r.chat(tok, &prompt, &tpl.render(&req.messages, &req.tools, think, preserve, false), &system)?;
                 if let Runner::Slot(c) = &*r && let Some(t) = c.started { t0 = t; start(&mut busy); }
                 prefilled = true;
                 t1 = Instant::now();
