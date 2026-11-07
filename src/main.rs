@@ -1239,6 +1239,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
         return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens) and /v1/models", "type": "permission_error"}}));
     }
     match (method.as_str(), route) {
+        // The part of llama-server's /props that clients use to learn what is being served and whether it sees images.
+        ("GET", "/props") => match l.as_ref() {
+            Some(l) => {
+                let ctx = s.stats.lock().unwrap().ctx;
+                send(&mut w, "200 OK", json!({"model_alias": l.name, "model_path": l.path, "modalities": {"vision": false, "audio": false}, "default_generation_settings": {"n_ctx": ctx}}))
+            }
+            None => send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})),
+        },
         ("GET", "/api/models") => {
             let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "loaded": l.as_ref().is_some_and(|l| l.path == p)})).collect();
             send(&mut w, "200 OK", json!({"dir": s.dir, "models": models}))
