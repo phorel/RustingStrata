@@ -127,6 +127,7 @@ impl Msg {
     /// prompt verbatim.
     pub fn from_json(m: &Json) -> anyhow::Result<Msg> {
         let role = m.get("role").as_str().context("message without role")?;
+        let role = if role == "developer" { "system" } else { role };  // OpenAI's name for it; pi sends it
         if !["system", "user", "assistant", "tool"].contains(&role) { bail!("unknown role {role:?}"); }
         let content = match m.get("content") {
             Json::Str(s) => s.clone(),
