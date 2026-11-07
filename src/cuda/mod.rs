@@ -190,11 +190,12 @@ impl Gpu {
             .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
             .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]))
             .chain(["attn_decode_gqa4_128".to_string()]);
+        let smem_optin = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as i32;
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
             // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
             if n.starts_with("attn_prefill") || n.starts_with("attn_decode_gqa") || n.starts_with("gemvn") {
-                f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96 << 10)?;
+                f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (smem_optin - f.get_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?).min(96 << 10))?;
             }
             fns.insert(n, f);
         }
@@ -361,7 +362,7 @@ impl Gpu {
         if gq_min != 0 { launch!(self, &format!("attn_decode_{hd}"), cfg(((nh * nt) as u32, ATT_SPLITS_1 as u32), 256, (8 * hd * 4) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
         // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async,
         // attn_decode_gqa4_128 one.
-        let cp = !self.kv_q8 && (hd == 128 || hd == 256);
+        let cp = !self.kv_q8 && (hd == 128 || hd == 256) && self.ctx.compute_capability()?.0 >= 8;
         let g4 = cp && g == 4 && hd == 128;
         let (name, cp) = if g4 { ("attn_decode_gqa4_128".to_string(), 2 * 32 * hd * 2) } else { (format!("attn_decode_gqa_{hd}"), if cp { 2 * 2 * 32 * hd * 2 } else { 0 }) };
         if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
@@ -656,7 +657,8 @@ impl Backend for Gpu {
 
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()> {
         if !matches!(hd, 64 | 128 | 256) { bail!("attention prefill: head_dim {hd} unsupported (64, 128 or 256)"); }
-        let smem = (2 * (64 + 32 + 32) * (hd + 8)) as u32;
+        let bk = if self.ctx.compute_capability()?.0 >= 8 { 32 } else { 16 };
+        let smem = (2 * (64 + 2 * bk) * (hd + 8)) as u32;
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
             q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32);
         Ok(())

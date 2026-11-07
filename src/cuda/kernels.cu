@@ -829,8 +829,16 @@ __device__ __forceinline__ void ldsm4t(u32* r, const u16* p) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    // Turing has only m16n8k8 for f16: two k8 halves give the same sum.
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a2), "r"(a3), "r"(b1));
+#endif
 }
 __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | ((u32)f2h(b) << 16); }
 
@@ -989,28 +997,56 @@ extern "C" __global__ void quant_q8(const float* x, int x_stride, u8* out, int c
     }
 }
 
+#if __CUDA_ARCH__ < 800
+// Turing's int8 mma is m8n8k16 only; rows 0-7 (a0) and 8-15 (a1) of an m16n8k16 are two of them sharing b0.
+__device__ __forceinline__ void mma_s8_88(int* c, u32 a, u32 b) {
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a), "r"(b));
+}
+#endif
 __device__ __forceinline__ void mma_s8_16816(int* c, u32 a0, u32 a1, u32 b0) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+#else
+    mma_s8_88(c, a0, b0);
+    mma_s8_88(c + 2, a1, b0);
+#endif
 }
 __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    mma_s8_16816(c, a0, a1, b0);
+    mma_s8_16816(c, a2, a3, b1);
+#endif
 }
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
 // The mma with every accumulator starting at I2F_BIAS: d = I2F_BIAS + sum, so i2f_small's integer add comes free.
 #define I2F_BIAS 0x4B400000
 __device__ __forceinline__ void mma_s8_16816_b(int* d, u32 a0, u32 a1, u32 b0) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b0), "r"(I2F_BIAS));
+#else
+    d[0] = d[1] = d[2] = d[3] = I2F_BIAS;
+    mma_s8_16816(d, a0, a1, b0);
+#endif
 }
 __device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(I2F_BIAS));
+#else
+    mma_s8_16816_b(d, a0, a1, b0);
+    mma_s8_16816(d, a2, a3, b1);
+#endif
 }
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
 template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
+#if __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
@@ -1021,6 +1057,17 @@ __device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
+#else
+// No cp.async before sm_80: copy synchronously (zero-filled when !ok); commit and wait become no-ops.
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
+    *(uint4*)dst = ok ? *(const uint4*)src : make_uint4(0, 0, 0, 0);
+}
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
+    *(uint2*)dst = ok ? *(const uint2*)src : make_uint2(0, 0);
+}
+__device__ __forceinline__ void cp_async_commit() {}
+template <int N> __device__ __forceinline__ void cp_async_wait() {}
+#endif
 
 // SM: as in gemm_q (gemmis_*, the tiles of at most 32 positions, 16 x 16 outputs per warp).
 template <int T, int SBB, int BM, bool SM>
@@ -1865,8 +1912,13 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
 #define ATT_ARGS const float* q, const u16* kc, const u16* vc, float* part, const int* step, int nh, int nkv, int hd, \
                  float scale, int gq_min, int pz, int nt, const int* sel, int sst
 #define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t; if (sel) sel += (size_t)t * sst;
+#if __CUDA_ARCH__ >= 800
+#define CP_OK true
+#else
+#define CP_OK false  // the cp.async K/V buffers would not fit Turing's 64 KB of shared memory
+#endif
 #define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
-#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || PER == 8)>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
+#define ATT_RUN_CP(G) attn_decode_t<PER, G, CP_OK && !KV_Q8 && (PER == 4 || PER == 8)>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
 #define DEF_ATT(HD)                                                                                          \
     extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
@@ -1955,8 +2007,18 @@ __device__ void topk_warp(const float* p, int n, int k, float extra_scale, int l
             unsigned i = lane + 32 * r, key = __float_as_uint(v[r]) + 1;
             if (i < n && !(taken >> r & 1) && key > bk) { bk = key; bi = i; }
         }
+#if __CUDA_ARCH__ >= 800
         unsigned mk = __reduce_max_sync(0xffffffff, bk);
         bi = __reduce_min_sync(0xffffffff, bk == mk ? bi : 0xffffffffu);
+#else
+        // __reduce_*_sync needs sm_80+; butterfly shuffles give the same result on Turing.
+        unsigned mk = bk;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mk = max(mk, __shfl_xor_sync(0xffffffff, mk, o));
+        bi = bk == mk ? bi : 0xffffffffu;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) bi = min(bi, __shfl_xor_sync(0xffffffff, bi, o));
+#endif
         float bv = __uint_as_float(mk - 1);
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (lane == j) { id = bi; mine = bv; }
@@ -2059,7 +2121,11 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 // gate at +HD per head; out [T, nh * HD] = softmax(q K^T * scale) V * sigmoid(gate). Shared: Q, K and V tiles, all
 // row-major; mma fragments come from ldmatrix (.trans for V).
 #define FA_BQ 64
+#if __CUDA_ARCH__ >= 800
 #define FA_BK 32
+#else
+#define FA_BK 16  // a 32-row K/V tile at head_dim 256 needs more than Turing's 64 KB of shared memory
+#endif
 // QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`. The mask has rows for the
 // tile padding past T too (their output is dropped).
 __device__ __forceinline__ bool qsa_bit(const unsigned* qm, int mw, int t, int key) {
