@@ -115,7 +115,9 @@ reverse proxy, systemd), see [docs/HOSTING.md](docs/HOSTING.md). Each customer k
 conversations; all requests under one key count as one user.
 
 Useful flags: `--ctx` (KV cache size, default 4096), `--mtp [N]` (speculative decoding with the model's draft
-head; greedy tokens stay the same, sampling keeps its distribution), `--chunk`, `--threads`, `--vram-margin`. On a
+head; greedy tokens stay the same, sampling keeps its distribution), `--ngram [N]` (drafts from repeated text: when the last N
+tokens, 8 by default, occurred earlier in the context, the 3 tokens that followed are verified in one forward; same
+output guarantees, about 190 MB of VRAM for rollback states, pays when the reply repeats the context), `--chunk`, `--threads`, `--vram-margin`. On a
 GPU that drives no display, `--vram-margin 256` keeps more experts resident (+1-2% prefill); 128 runs out of
 memory. `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower
 32K prefill. Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking.

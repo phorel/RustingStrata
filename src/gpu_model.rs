@@ -164,6 +164,11 @@ pub struct GpuModel<'a> {
     pub resumed: std::cell::Cell<usize>,
     /// MTP drafts (made, accepted).
     pub drafts: (usize, usize),
+    /// N-gram drafts (made, accepted).
+    pub ngram: (usize, usize),
+    /// Rollback snapshots per verify: the most drafts a `spec_step` can take back. `TMAX` - 1 under `STRATA_NGRAM`
+    /// (set by `--ngram`) where the model can roll back, else `k` as loaded.
+    pub snaps: usize,
     /// Split model, all parts but the last: seconds from the start of this part's forward until its GPU is done, and
     /// for the copy of its hidden rows to the next part.
     pub split_time: (Duration, Duration),
@@ -263,6 +268,10 @@ impl<'a> GpuModel<'a> {
         // ponytail: no MTP or batched prefill with hyper-connections yet (their state and row layouts assume one stream).
         let k = if c.n_nextn > 0 && c.hc_n == 0 { k.min(TMAX - 1) } else { 0 };
         let mtp = k > 0;
+        // ponytail: n-gram drafts need `rollback`, which restores neither a split model's other parts nor the PLE and
+        // QSA rings.
+        let ngram = std::env::var_os("STRATA_NGRAM").is_some() && c.hc_n == 0 && c.n_embd_ple == 0 && c.idx_top_k == 0 && ns == 1 && range == (0..c.n_layer);
+        let snaps = if ngram { TMAX - 1 } else { k };
         let load_layer = |il: usize, kind: LayerKind| -> anyhow::Result<Layer> {
             let mixer = if kind == LayerKind::Delta {
                 Mixer::Delta {
@@ -271,7 +280,7 @@ impl<'a> GpuModel<'a> {
                     conv_w: lt(il, "ssm_conv1d.weight")?, norm: lt(il, "ssm_norm.weight")?, out: lt(il, "ssm_out.weight")?,
                     conv: (0..ns).map(|_| gpu.zeros::<f32>((c.ssm_conv - 1) * channels)).collect::<anyhow::Result<_>>()?,
                     s: (0..ns).map(|_| gpu.zeros::<f32>(nv * c.ssm_dv() * dk)).collect::<anyhow::Result<_>>()?,
-                    snap: if mtp { Some((gpu.zeros::<f32>(k * (c.ssm_conv - 1) * channels)?, gpu.zeros::<f32>(k * c.ssm_d_inner * dk)?)) } else { None },
+                    snap: if snaps > 0 { Some((gpu.zeros::<f32>(snaps * (c.ssm_conv - 1) * channels)?, gpu.zeros::<f32>(snaps * c.ssm_d_inner * dk)?)) } else { None },
                 }
             } else {
                 Mixer::Attn {
@@ -392,7 +401,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), ngram: (0, 0), snaps, split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -695,7 +704,7 @@ impl<'a> GpuModel<'a> {
     /// Keep only the first `keep` tokens of the last `verify`, which started at position `start` (1 <= keep <= `k`):
     /// recurrent states come from the snapshots it wrote, KV entries past them are dropped by rewinding `pos`.
     pub fn rollback(&mut self, start: usize, keep: usize) -> anyhow::Result<()> {
-        if !(1..=self.k).contains(&keep) || start + keep > self.pos { bail!("rollback: keep {keep} of verify at {start}"); }
+        if !(1..=self.snaps).contains(&keep) || start + keep > self.pos { bail!("rollback: keep {keep} of verify at {start}"); }
         let g = &self.gpu;
         for l in &self.layers {
             if let Mixer::Delta { conv, s, snap: Some((sc, ss)), .. } = &l.mixer {
@@ -839,22 +848,31 @@ impl<'a> GpuModel<'a> {
     /// argmax, and the output equals plain `step` decoding (verify is bit-identical to steps). Sampling: a draft is
     /// kept with its probability (`Sampler::accept`), so tokens have the distribution of plain sampling. The draft head entries of accepted drafts wait for the next call's first draft pass,
     /// which runs them with `t` in one batch (their main model rows 0..n precede `t`'s row n).
-    pub fn spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32, usize)> {
-        let k = self.k;
-        if self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?)? as u32, 0)); }
-        let h = self.mtp.as_mut().unwrap();
-        let mut first = std::mem::take(&mut h.pend);
-        if first.len() != row { first.clear(); }
-        first.push(t);
-        let nf = first.len();
-        let hp = h.pos + nf - 1;
+    /// `ng` not empty: those tokens (the caller's n-gram match, at most `snaps`) are the drafts instead; a draft head
+    /// then only gets its entries for `t` and the drafts accepted before it, so it stays in step.
+    pub fn spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler, ng: &[u32]) -> anyhow::Result<(Vec<u32>, u32, usize)> {
+        let k = if ng.is_empty() { self.k } else { ng.len().min(self.snaps) };
+        if k == 0 || self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?)? as u32, 0)); }
         let mut toks = vec![t];
-        let mut hid = self.row_ptr(row + 1 - nf);
-        for i in 0..k {
-            let d = if i == 0 { self.mtp_run(&first, hid, true)? } else { self.mtp_run(&toks[i..=i], hid, true)? };
-            hid = self.mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.m.cfg.n_embd) as u64;
-            toks.push(d);
+        let mut hp = 0;
+        if let Some(h) = self.mtp.as_mut() {
+            let mut first = std::mem::take(&mut h.pend);
+            if first.len() != row { first.clear(); }
+            first.push(t);
+            let nf = first.len();
+            hp = h.pos + nf - 1;
+            let mut hid = self.row_ptr(row + 1 - nf);
+            if ng.is_empty() {
+                for i in 0..k {
+                    let d = if i == 0 { self.mtp_run(&first, hid, true)? } else { self.mtp_run(&toks[i..=i], hid, true)? };
+                    hid = self.mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.m.cfg.n_embd) as u64;
+                    toks.push(d);
+                }
+            } else {
+                self.mtp_run(&first, hid, false)?;
+            }
         }
+        toks.extend_from_slice(&ng[..if ng.is_empty() { 0 } else { k }]);
         let start = self.pos;
         let (n, next) = if smp.temp <= 0.0 {
             self.verify_greedy(&toks, |am| (0..k).take_while(|&i| am[i] == toks[i + 1]).count())?
@@ -866,13 +884,15 @@ impl<'a> GpuModel<'a> {
                 match smp.accept(&l[n], toks[n + 1] as usize)? { None => n += 1, Some(x) => break (n, x as u32) }
             }
         };
-        self.drafts.0 += k;
-        self.drafts.1 += n;
+        let made = if ng.is_empty() { &mut self.drafts } else { &mut self.ngram };
+        made.0 += k;
+        made.1 += n;
         if n < k { self.rollback(start, n + 1)?; }
         // Draft head entries past t were made from draft hidden states: the next call redoes them from main rows.
-        let h = self.mtp.as_mut().unwrap();
-        h.pos = hp + 1;
-        h.pend = toks[1..=n].to_vec();
+        if let Some(h) = self.mtp.as_mut() {
+            h.pos = hp + 1;
+            h.pend = toks[1..=n].to_vec();
+        }
         toks.truncate(n + 1);
         Ok((toks, next, n))
     }
@@ -984,7 +1004,7 @@ impl<'a> GpuModel<'a> {
             }
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
-                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
+                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.snaps));
                     g.batch(&mut || {
                         mv2(qkv, gate, "qkv", "z")?;
                         mv2(beta, alpha, "beta", "g")

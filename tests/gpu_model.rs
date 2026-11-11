@@ -185,7 +185,7 @@ fn mtp_spec_matches_greedy() {
             let (mut out, mut row) = (vec![], 0);
             while out.len() < n {
                 if k > 0 {
-                    let (toks, nx, r) = gm.spec_step(t, row, &mut ops::Sampler::greedy()).unwrap();
+                    let (toks, nx, r) = gm.spec_step(t, row, &mut ops::Sampler::greedy(), &[]).unwrap();
                     (t, row) = (nx, r);
                     out.extend(toks);
                 } else {
@@ -203,6 +203,47 @@ fn mtp_spec_matches_greedy() {
             assert_eq!(spec, plain, "k {k}");
             if k == 1 { assert!(2 * ok >= made, "acceptance {ok}/{made}"); }
         }
+    }
+}
+
+/// `spec_step` with drafts from the caller (n-gram drafting) gives the same tokens as plain steps, whether the drafts
+/// are right or have a wrong token, and with draft head steps in between where the model has a head.
+#[test]
+fn ngram_spec_matches_greedy() {
+    let _gpu = common::gpu_lock();
+    let Some(p) = common::model_path() else { return };
+    let g = Gguf::open(&p).unwrap();
+    let m = Model::load(&g).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    unsafe { std::env::set_var("STRATA_NGRAM", "1") };
+    for (bk, gpu) in common::backends() {
+        eprintln!("backend {bk}");
+        let mut gm = GpuModel::load(&m, gpu, 512, 0, 512 << 20, 1).unwrap();
+        if gm.snaps < 3 { eprintln!("SKIP: no rollback for this model"); return }
+        gm.adapt_every = 0;
+        let ids = tok.encode("Write a short story about a dragon.").unwrap();
+        let n = 64;
+        let mut t = ops::argmax(&gm.prefill(&ids).unwrap()) as u32;
+        let mut plain = vec![];
+        while plain.len() < n + 4 {
+            plain.push(t);
+            t = ops::argmax(&gm.step(t).unwrap()) as u32;
+        }
+        gm.reset().unwrap();
+        let mut t = ops::argmax(&gm.prefill(&ids).unwrap()) as u32;
+        let (mut out, mut row, mut call) = (vec![], 0, 0);
+        while out.len() < n {
+            // The plain continuation as drafts; every second call has one wrong token, every fourth uses the head.
+            let mut d = plain[out.len() + 1..out.len() + 4].to_vec();
+            if call % 2 == 1 { d[call / 2 % 3] ^= 1; }
+            if call % 4 == 3 { d.clear(); }
+            let (toks, nx, r) = gm.spec_step(t, row, &mut ops::Sampler::greedy(), &d).unwrap();
+            (t, row, call) = (nx, r, call + 1);
+            out.extend(toks);
+        }
+        eprintln!("n-gram drafts accepted {}/{}, head drafts {}/{}", gm.ngram.1, gm.ngram.0, gm.drafts.1, gm.drafts.0);
+        assert_eq!(out[..n], plain[..n]);
+        assert!(gm.ngram.1 > 0 && gm.ngram.1 < gm.ngram.0);
     }
 }
 

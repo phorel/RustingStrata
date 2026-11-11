@@ -35,6 +35,11 @@ struct Engine {
     /// [default: calibrated, else 0].
     #[arg(long, value_name = "N", default_missing_value = "1", num_args = 0..=1)]
     mtp: Option<usize>,
+    /// Draft from repeated text: when the last N tokens occurred earlier in the context, propose the tokens that
+    /// followed them and verify them in one forward (GPU; greedy output unchanged, sampling keeps its distribution).
+    /// Works with or without --mtp; pays where the reply repeats the context (rewriting a file, quoting code).
+    #[arg(long, value_name = "N", default_value_t = 0, default_missing_value = "8", num_args = 0..=1)]
+    ngram: usize,
     /// Sampling temperature; 0 is greedy.
     #[arg(long, default_value_t = 0.0)]
     temp: f32,
@@ -171,6 +176,7 @@ impl Runner<'_> {
             let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
             let (hits, misses) = (sum(&|p| p.hits), sum(&|p| p.misses));
             if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
+            if g.ngram.0 > 0 { eprintln!("n-gram drafts accepted {}/{} ({:.1}%)", g.ngram.1, g.ngram.0, 100.0 * g.ngram.1 as f64 / g.ngram.0 as f64); }
             eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * hits as f64 / (hits + misses).max(1) as f64, misses,
                 sum(&|p| p.cache.as_ref().map_or(0, |c| c.swaps)));
             let resumed = sum(&|p| p.resumed.get());
@@ -205,6 +211,7 @@ impl Engine {
             return Ok(Runner::Cpu(m, State::new(&m.cfg)));
         };
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
+        if self.ngram > 0 { unsafe { std::env::set_var("STRATA_NGRAM", "1") } }  // read by GpuModel::load_part
         let mut g = if self.parallel > 1 {
             if self.mtp() > 0 { eprintln!("--parallel: decoding without MTP drafts"); }
             self.mtp = Some(0);
@@ -214,6 +221,9 @@ impl Engine {
         };
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
+        if self.ngram > 0 && g.snaps < NGRAM_DRAFTS {
+            eprintln!("--ngram: not supported for this model or setup (--parallel, several GPUs, hyper-connections, PLE or QSA), decoding without it");
+        }
         if self.mtp() > 0 && g.k == 0 {
             eprintln!("--mtp: this model has no MTP draft head (or it is split over GPUs), decoding without it");
             self.mtp = Some(0);
@@ -463,7 +473,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let t1 = Instant::now();
             let (cpu0, split0) = (r.cpu_secs(), r.split_secs());
             let cap = room(&engine, ids.len(), n);
-            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
+            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, engine.ngram, &ids, &mut engine.sampler(), logits, cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             if out.len() == cap && cap < n { eprint!("\n(stopped: the context is full at {} tokens; raise --ctx)", engine.ctx); }
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
@@ -525,7 +535,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let l = r.prefill(&ids)?;
                     p.push(n as f64 / t.elapsed().as_secs_f64());
                     let t = Instant::now();
-                    let k = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, &mut |_| Ok(false))?.0.len();
+                    let k = decode(&mut r, &tok, engine.mtp() > 0, engine.ngram, &ids, &mut Sampler::greedy(), l, tg, &mut |_| Ok(false))?.0.len();
                     d.push(k as f64 / t.elapsed().as_secs_f64());
                 }
                 let stat = |v: &[f64]| {
@@ -557,7 +567,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
                 let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, engine.preserve_thinking, true), &tpl.render(&msgs, &[], think, engine.preserve_thinking, false), "")?;
-                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
+                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, engine.ngram, &ids, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
                 println!();
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
             }
@@ -810,7 +820,7 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
         let t = best(&mut || {
             r.reset()?;
             let l = r.prefill(&dec)?;
-            toks = decode(&mut r, &tok, k > 0, &mut Sampler::greedy(), l, 128, &mut |_| Ok(false))?.0.len();
+            toks = decode(&mut r, &tok, k > 0, 0, &[], &mut Sampler::greedy(), l, 128, &mut |_| Ok(false))?.0.len();
             Ok(())
         })?;
         // `best` times prefill too; it is the same for every k, so the ranking holds.
@@ -829,21 +839,61 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     Ok(())
 }
 
+/// Most n-gram drafts per step: a verify forward takes `TMAX` tokens, the first of which is not a draft.
+const NGRAM_DRAFTS: usize = rusting_strata::cpu_worker::TMAX - 1;
+
+/// N-gram drafts for `GpuModel::spec_step`: the tokens that followed the latest earlier occurrence of the last `n`
+/// tokens of the context.
+struct Ngram { n: usize, hist: Vec<u32>, at: std::collections::HashMap<u64, u32> }
+
+impl Ngram {
+    fn new(n: usize, prompt: &[u32]) -> Ngram {
+        let mut g = Ngram { n, hist: Vec::with_capacity(prompt.len() + 1024), at: Default::default() };
+        for &t in prompt { g.push(t); }
+        g
+    }
+    fn key(w: &[u32]) -> u64 { w.iter().fold(0xcbf29ce484222325, |h, &t| (h ^ t as u64).wrapping_mul(0x100000001b3)) }
+    /// Appends `t`: the `n` tokens before it now lead to its position, so a tail never matches itself.
+    fn push(&mut self, t: u32) {
+        let l = self.hist.len();
+        if l >= self.n { self.at.insert(Self::key(&self.hist[l - self.n..]), l as u32); }
+        self.hist.push(t);
+    }
+    /// Up to `max` tokens that followed the last `n` tokens the previous time they occurred.
+    fn draft(&self, max: usize) -> &[u32] {
+        let l = self.hist.len();
+        if l < self.n { return &[]; }
+        let tail = &self.hist[l - self.n..];
+        match self.at.get(&Self::key(tail)).map(|&p| p as usize) {
+            Some(p) if self.hist[p - self.n..p] == *tail => &self.hist[p..l.min(p + max)],
+            _ => &[],
+        }
+    }
+}
+
 /// Decoding of up to `n` tokens after `logits`; `emit` gets each new complete piece of text and returns true to stop.
-/// Returns the tokens and whether an end-of-turn token or `emit` stopped it.
-fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut logits: Vec<f32>, n: usize,
+/// Returns the tokens and whether an end-of-turn token or `emit` stopped it. `ngram` > 0: n-gram drafts of that match
+/// length from `prompt` (the tokens before `logits`) and the reply so far.
+fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, ngram: usize, prompt: &[u32], smp: &mut Sampler, mut logits: Vec<f32>, n: usize,
           emit: &mut dyn FnMut(&str) -> anyhow::Result<bool>) -> anyhow::Result<(Vec<u32>, bool)> {
     let eos = tok.eos_ids();
+    let mut ng = match r { Runner::Gpu(g) if ngram > 0 && g.snaps >= NGRAM_DRAFTS => Some(Ngram::new(ngram, prompt)), _ => None };
     // `ahead`: the next token when `spec_step` or `step_greedy` already picked it.
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
     let (mut out, mut start, mut row, mut ahead) = (Vec::new(), 0, 0, None);
     while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
         if eos.contains(&next) { return Ok((out, true)); }
+        // Drafts stop before an end-of-turn token and at the reply's last token, so the model never runs past either.
+        let d: Vec<u32> = ng.as_mut().map_or(vec![], |g| {
+            g.push(next);
+            g.draft(NGRAM_DRAFTS.min(n - out.len() - 1)).iter().copied().take_while(|t| !eos.contains(t)).collect()
+        });
         let toks = match r {
-            Runner::Gpu(g) if mtp => {
-                let (toks, nx, rw) = g.spec_step(next, row, smp)?;
+            Runner::Gpu(g) if mtp || !d.is_empty() => {
+                let (toks, nx, rw) = g.spec_step(next, row, smp, &d)?;
                 (ahead, row) = (Some(nx), rw);
+                if let Some(g) = ng.as_mut() { for &t in &toks[1..] { g.push(t); } }
                 toks
             }
             // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
@@ -1366,7 +1416,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
-                decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
+                decode(r, tok, e.mtp() > 0, e.ngram, &ids, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
                     k += 1;
