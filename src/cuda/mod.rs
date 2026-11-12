@@ -246,10 +246,11 @@ fn device_log(device: usize, name: &str, arch: &str, cc: (i32, i32), gemm_fma: b
 }
 
 /// Whether the device has int8 tensor cores, i.e. whether the `gemmi_*`/`gemmis_*` prefill GEMM exists in its cubin
-/// and may be launched. Volta (sm_70) does not: the s8 `mma` shapes need sm_80, so the kernels are compiled out of
-/// the sm_70 build (see the `#if __CUDA_ARCH__ >= 800` guards in kernels.cu) and dropped from the loaded name list.
+/// and may be launched. Volta (sm_70) does not, so the kernels are compiled out of the sm_70 build (see the
+/// `#if __CUDA_ARCH__ >= 750` guards in kernels.cu) and dropped from the loaded name list. Turing (sm_75) runs the
+/// m16n8k16/k32 shapes as m8n8k16 pairs.
 /// This is the CUDA launch gate only: `Gpu::mmq` stays the pure type policy shared with Vulkan and the tests.
-fn int8_gemm_arch(cc: (i32, i32)) -> bool { cc.0 >= 8 }
+fn int8_gemm_arch(cc: (i32, i32)) -> bool { cc >= (7, 5) }
 
 /// The dynamic shared memory a launch of kernel `name` can request, with its family for the startup log: the fixed
 /// maximum of the attention prefill (`attn_prefill_smem`, the only place that knows the tile layout) and of the
@@ -591,9 +592,9 @@ impl Gpu {
         let reuse = same && q8.1 == key;
         // The int8 path loads q8 rows 16 bytes at a time: their stride (cols * 11 / 8) is aligned only for cols % 128 == 0.
         // A SAME_X gemm inside a batch cannot quantize x (the quantize and the gemm would land on different streams):
-        // when the cached q8 rows are not x's, use the f16 kernel. Volta and Turing have no int8 tensor-core mma: there the
+        // when the cached q8 rows are not x's, use the f16 kernel. Volta has no int8 tensor-core mma: there the
         // kernels are not loaded (`i8_gemm`), so this gate must dominate `STRATA_MMQ`; they take the f16 gemm_*/gemms_*.
-        let int8 = self.i8_gemm && self.int8_mma && Self::mmq(ty) && cols.is_multiple_of(128);
+        let int8 = self.int8_on(ty) && cols.is_multiple_of(128);
         if !int8 || (same && !reuse && self.nb.load(Relaxed) < BESIDE) {
             if !same { q8.1 = None; }
             launch!(self, &kname(if sm { "gemms" } else { "gemm" }, ty), cfg(grid, 2 * GEMM_BM as u32, 0),
@@ -618,7 +619,7 @@ impl Gpu {
     /// Quantize `x` for the int8 GEMM, unless the cache already holds the same rows; `None` when `ty` or `cols`
     /// selects the f16 path. Shared by `gemm_raw` and `prequant_gemm_x`.
     fn q8_x(&self, q8: &mut (CudaSlice<u8>, Option<[u64; 4]>), ty: GgmlType, cols: usize, n_x: usize, x: u64, x_stride: usize) -> anyhow::Result<Option<u64>> {
-        if !self.int8_mma || !Self::mmq(ty) || !cols.is_multiple_of(128) { return Ok(None); }
+        if !self.int8_on(ty) || !cols.is_multiple_of(128) { return Ok(None); }
         let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
         if q8.1 == key { return Ok(Some(self.ptr(&q8.0))); }
         let need = n_x * (cols + cols / 8 + cols / 4);
@@ -727,6 +728,11 @@ impl Gpu {
     /// Stream sync that polls an event with long pauses between queries. The driver's own sync (and the sync inside
     /// a copy to pageable memory) queries in a tight loop, which slows the CPU expert threads (+2% decode with many
     /// expert misses, 35B on a 7600X; blocking gains 4% but adds its wake-up latency to every token and prefill layer).
+    /// Whether `ty`'s prefill GEMM runs on int8 tensor cores here. Turing takes it only for the Gyro trellis types,
+    /// whose f16 path decodes every weight from the codebook (Gyro-S 512-token prefill 288 vs 241 tok/s on an
+    /// RTX 2060 SUPER); Q4_K and IQ1_M measured the same or slower with it, so they keep the f16 GEMM.
+    fn int8_on(&self, ty: GgmlType) -> bool { self.i8_gemm && Self::mmq(ty) && (self.int8_mma || ty.tq().is_some()) }
+
     fn wait(&self) -> anyhow::Result<()> {
         self.ctx.bind_to_thread()?;
         self.done.record(&self.stream)?;
@@ -742,10 +748,11 @@ impl Backend for Gpu {
     fn device(&self) -> String { self.ctx.name().unwrap_or_default() }
     /// The type policy gated on this device: `gemm_raw` takes the f16 `gemm_*` path where the arch has no int8
     /// tensor cores (Volta), so a test comparing kernels must not expect `gemmi_*` there.
-    fn mmq(&self, ty: GgmlType) -> bool { self.i8_gemm && Gpu::mmq(ty) }
-    /// sm_70 runs `mma16816` on CUDA cores (the `__CUDA_ARCH__ < 800` branch in kernels.cu): the same f16 products
-    /// summed in another order than `mma.sync`, so a cross-backend comparison is by tolerance, not bit for bit.
-    fn volta(&self) -> bool { !self.i8_gemm }
+    fn mmq(&self, ty: GgmlType) -> bool { self.int8_on(ty) }
+    /// sm_70 runs `mma16816` on CUDA cores and sm_75 as two k8 steps (the `__CUDA_ARCH__ < 800` branch in kernels.cu):
+    /// the same f16 products summed in another order than `mma.sync`, so a cross-backend comparison is by tolerance,
+    /// not bit for bit.
+    fn volta(&self) -> bool { !self.int8_mma }
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf> {
         let s = self.stream.alloc_zeros::<u8>(bytes.max(1))?;
         Ok(Buf::new(self.ptr(&s), s.len(), s))
@@ -873,7 +880,7 @@ impl Backend for Gpu {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(GEMM_BM), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
 
-    fn int8_gemm(&self, ty: GgmlType) -> bool { self.int8_mma && Self::mmq(ty) }
+    fn int8_gemm(&self, ty: GgmlType) -> bool { self.int8_on(ty) }
 
     fn prequant_gemm_x(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize) -> anyhow::Result<()> {
         let mut q8 = self.q8.lock().unwrap();
@@ -1313,7 +1320,7 @@ mod tests {
     #[test]
     fn int8_gemm_arch() {
         assert!(!super::int8_gemm_arch((7, 0)));
-        assert!(!super::int8_gemm_arch((7, 5)));
+        assert!(super::int8_gemm_arch((7, 5)));
         assert!(super::int8_gemm_arch((8, 0)));
         assert!(super::int8_gemm_arch((8, 6)));
         assert!(super::int8_gemm_arch((9, 0)));

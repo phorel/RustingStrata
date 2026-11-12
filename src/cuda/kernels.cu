@@ -1255,29 +1255,56 @@ extern "C" __global__ void quant_q8(const float* x, int x_stride, u8* out, int c
     }
 }
 
-// int8 tensor-core mma (sm_80+). On Turing the int8 path is not built: gemm_raw uses the f16 GEMM there.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+// int8 tensor-core mma (sm_75+; Volta has none, so gemm_raw uses the f16 GEMM there).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+// Turing's int8 mma is m8n8k16 only; rows 0-7 (a0) and 8-15 (a1) of an m16n8k16 are two of them sharing b0.
+__device__ __forceinline__ void mma_s8_88(int* c, u32 a, u32 b) {
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a), "r"(b));
+}
+#endif
 __device__ __forceinline__ void mma_s8_16816(int* c, u32 a0, u32 a1, u32 b0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    mma_s8_88(c, a0, b0);
+    mma_s8_88(c + 2, a1, b0);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+#endif
 }
 __device__ __forceinline__ void mma_s8_16832(int* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    mma_s8_16816(c, a0, a1, b0);
+    mma_s8_16816(c, a2, a3, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 // int -> float for |c| < 2^22 without the quarter-rate I2F: 2^23 + 2^22 + c has c in its low mantissa bits.
 __device__ __forceinline__ float i2f_small(int c) { return __int_as_float(0x4B400000 + c) - 12582912.0f; }
 // The mma with every accumulator starting at I2F_BIAS: d = I2F_BIAS + sum, so i2f_small's integer add comes free.
 #define I2F_BIAS 0x4B400000
 __device__ __forceinline__ void mma_s8_16816_b(int* d, u32 a0, u32 a1, u32 b0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    d[0] = d[1] = d[2] = d[3] = I2F_BIAS;
+    mma_s8_16816(d, a0, a1, b0);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b0), "r"(I2F_BIAS));
+#endif
 }
 __device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    mma_s8_16816_b(d, a0, a1, b0);
+    mma_s8_16816(d, a2, a3, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(I2F_BIAS));
+#endif
 }
-#endif  // __CUDA_ARCH__ >= 800
+#endif  // __CUDA_ARCH__ >= 750
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
 template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 || (T >= 144 && T <= 151); }
 // Volta (sm_70) has no cp.async (sm_80+). There the copy is a synchronous typed load/store by the same thread,
@@ -1335,9 +1362,9 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 }
 #endif
 
-// sm_80+ only: Volta and Turing have no usable int8 tensor-core path here (see the guard above).
+// sm_75+ only: Volta has no int8 tensor-core path here (see the guard above).
 // SM: as in gemm_q (gemmis_*, the tiles of at most 32 positions, 16 x 16 outputs per warp).
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 template <int T, int SBB, int BM, bool SM>
 __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int nd, const u8* __restrict__ x,
                                         const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
