@@ -15,6 +15,10 @@ struct Cli {
     /// the browser.
     #[command(subcommand)]
     cmd: Option<Cmd>,
+    /// GGUF holding the n-gram (PLE) table `per_layer_token_embd.weight`, for a Qwen3.8-Flash-Next file that comes
+    /// without it (the `-noPLE` Gyro files). A model that has its own table keeps it.
+    #[arg(long, global = true)]
+    ple: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -396,7 +400,9 @@ enum Cmd {
 }
 
 fn main() -> anyhow::Result<()> {
-    let Some(cmd) = Cli::parse().cmd else {
+    let cli = Cli::parse();
+    if let Some(p) = &cli.ple { unsafe { std::env::set_var("STRATA_PLE", p) } }  // read by Gguf::open
+    let Some(cmd) = cli.cmd else {
         // Started without arguments, as by a double click: keep the window open on an error so it can be read.
         let Some(Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine }) = Cli::parse_from(["strata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
         engine.cpu_fallback = true;

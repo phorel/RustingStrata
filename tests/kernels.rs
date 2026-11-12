@@ -1125,7 +1125,7 @@ fn gemv_partial_superblocks_and_q2_0() {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
                 let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
-                let all = Tensor { ty, cols, rows: ne * rows, data: &data };
+                let all = Tensor { ty, cols, rows: ne * rows, data: &data, rot: None };
                 let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
                 // Raw bytes, as experts are uploaded (`Backend::upload` turns Q4_0 / Q5_0 into Q8_0).
                 let raw = |t: &Tensor| { let b = gpu.alloc(t.data.len()).unwrap(); gpu.htod(t.data, &b, 0).unwrap(); GpuTensor::new(t.ty, t.rows, t.cols, b) };
@@ -1279,7 +1279,7 @@ fn f16_weight_uploads_as_f32() {
     let (rows, cols) = (96, 512);
     let w: Vec<f32> = xs(rows * cols).iter().map(|v| v * 3.0).collect();
     let data: Vec<u8> = w.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
-    let t = Tensor { ty: GgmlType::F16, rows, cols, data: &data };
+    let t = Tensor { ty: GgmlType::F16, rows, cols, data: &data, rot: None };
     let wf: Vec<f32> = w.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect();
     let nt = 40;
     let x = xs(nt * cols);

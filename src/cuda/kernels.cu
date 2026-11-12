@@ -1,5 +1,5 @@
 // Decode-path kernels. Dequant ports of src/quant/mod.rs (from llama.cpp ggml-quants.c, MIT License, ggml authors).
-// Tables (iq2xs_grid, iq3xxs_grid, ksigns_iq2xs, kvalues_iq4nl) are prepended by src/cuda/mod.rs.
+// Tables (iq2xs_grid, iq3xxs_grid, ksigns_iq2xs, kvalues_iq4nl, tq_cb, tq_cb8) are prepended by src/cuda/mod.rs.
 
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -195,6 +195,30 @@ template <> __device__ __forceinline__ void deq8<20>(const u8* b, int sub, float
     const u8* q = p + 2 + (r & 15);
     for (int i = 0; i < 8; i++) o[i] = d * (float)kvalues_iq4nl[r < 16 ? q[i] & 0xF : q[i] >> 4];
 }
+// Gyro trellis types with 4 weights per step (src/quant/tq.rs): 2 blocks of 2 + 4 K bytes per 256, each a f16 d and a
+// circular stream of 32 steps of K bits. Lane `sub` takes steps 2 (sub & 15) and + 1 of block sub >> 4.
+template <int K> __device__ __forceinline__ void deq8_tq(const u8* b, int sub, float* o) {
+    const u8* p = b + (2 + 4 * K) * (sub >> 4);
+    float d = ldh(p);
+    const u8* qs = p + 2;
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        u32 t = 2 * (sub & 15) + i, s;
+        if (K == 8) s = ((u32)qs[(t + 31) & 31] << 8) | qs[t];
+        else {
+            u32 nb = 4 * K, off = (31 - t) * K, i0 = off >> 3;
+            s = ((qs[i0] | ((u32)qs[(i0 + 1) % nb] << 8) | ((u32)qs[(i0 + 2) % nb] << 16)) >> (off & 7)) & 0xFFFF;
+        }
+        u32 x = (s & 0x7FFF) * 0x9E3779B1u, a = x >> 21, c = (x >> 10) & 2047;
+        o[4 * i] = d * h2f(tq_cb[2 * a]); o[4 * i + 1] = d * h2f(tq_cb[2 * a + 1]);
+        o[4 * i + 2] = d * h2f(tq_cb[2 * c]); o[4 * i + 3] = d * h2f(tq_cb[2 * c + 1]);
+    }
+}
+template <> __device__ __forceinline__ void deq8<151>(const u8* b, int sub, float* o) { deq8_tq<4>(b, sub, o); }  // TQK4
+template <> __device__ __forceinline__ void deq8<150>(const u8* b, int sub, float* o) { deq8_tq<5>(b, sub, o); }  // TQK5
+template <> __device__ __forceinline__ void deq8<145>(const u8* b, int sub, float* o) { deq8_tq<6>(b, sub, o); }  // TQK6
+template <> __device__ __forceinline__ void deq8<146>(const u8* b, int sub, float* o) { deq8_tq<7>(b, sub, o); }  // TQK7
+template <> __device__ __forceinline__ void deq8<144>(const u8* b, int sub, float* o) { deq8_tq<8>(b, sub, o); }  // TQ2_T
 // Q4_1 / Q5_1, 8 blocks of 20 / 24 per 256: f16 d, f16 m, (Q5_1: u32 qh,) 16 bytes of nibbles; element j of a block is the
 // low nibble of byte j (j < 16) or the high nibble of byte j - 16, plus 16 for bit j of qh; value d q + m.
 template <int T> __device__ __forceinline__ const u8* q41_blk(const u8* b, int sub, int& r) {
@@ -515,6 +539,36 @@ template <int T> __device__ __forceinline__ void deq8_q40(const u8* b, int sub, 
 }
 template <> __device__ __forceinline__ void deq8<2>(const u8* b, int sub, float* o) { deq8_q40<2>(b, sub, o); }  // Q4_0
 template <> __device__ __forceinline__ void deq8<6>(const u8* b, int sub, float* o) { deq8_q40<6>(b, sub, o); }  // Q5_0
+// Gyro trellis types (see deq8_tq): the two steps of lane `sub` as 8 int8, from the codebook rounded to int8 (`cb`: a
+// point's two values times TQ8_SCALE in a u16).
+#define TQ8_SCALE 31.0f
+template <int K> __device__ __forceinline__ void tq_get(const u16* cb, const u8* b, int sub, int& lo, int& hi, float& d) {
+    const u8* p = b + (2 + 4 * K) * (sub >> 4);
+    d = ldh(p) * (1.0f / TQ8_SCALE);
+    const u8* qs = p + 2;
+    int w[2];
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        u32 t = 2 * (sub & 15) + i, s;
+        if (K == 8) s = ((u32)qs[(t + 31) & 31] << 8) | qs[t];
+        else {
+            u32 nb = 4 * K, off = (31 - t) * K, i0 = off >> 3;
+            s = ((qs[i0] | ((u32)qs[(i0 + 1) % nb] << 8) | ((u32)qs[(i0 + 2) % nb] << 16)) >> (off & 7)) & 0xFFFF;
+        }
+        u32 x = (s & 0x7FFF) * 0x9E3779B1u;
+        w[i] = (int)((u32)cb[x >> 21] | ((u32)cb[(x >> 10) & 2047] << 16));
+    }
+    lo = w[0]; hi = w[1];
+}
+template <int K> struct QITQ {
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) { tq_get<K>(tq_cb8, b, sub, lo, hi, d); }
+};
+template <> struct QI<151> : QITQ<4> {};
+template <> struct QI<150> : QITQ<5> {};
+template <> struct QI<145> : QITQ<6> {};
+template <> struct QI<146> : QITQ<7> {};
+template <> struct QI<144> : QITQ<8> {};
 template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 only)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
@@ -651,6 +705,19 @@ template <> struct QS<22> : QI<22> {
     }
 };
 
+// The trellis types' int8 codebook (4 KB) in shared memory, for the same reason.
+__shared__ u16 s_tq_cb8[2048];
+template <int K> struct QSTQ : QITQ<K> {
+    static constexpr bool SH = true;
+    __device__ static void load() { for (int i = threadIdx.x; i < 2048; i += blockDim.x) s_tq_cb8[i] = tq_cb8[i]; }
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) { tq_get<K>(s_tq_cb8, b, sub, lo, hi, d); }
+};
+template <> struct QS<151> : QSTQ<4> {};
+template <> struct QS<150> : QSTQ<5> {};
+template <> struct QS<145> : QSTQ<6> {};
+template <> struct QS<146> : QSTQ<7> {};
+template <> struct QS<144> : QSTQ<8> {};
+
 template <int T, int SBB, bool P, class Q = QI<T>>
 __device__ __forceinline__ void gemv_row_q(const u8* __restrict__ w, const signed char* qs, const float* xd, float* y, int row, int cols) {
     int lane = threadIdx.x & 31;
@@ -700,7 +767,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
     X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(2, q4_0, 144) X(6, q5_0, 176) \
-    X(3, q4_1, 160) X(7, q5_1, 192)
+    X(3, q4_1, 160) X(7, q5_1, 192) X(151, tqk4, 36) X(150, tqk5, 44) X(145, tqk6, 52) X(146, tqk7, 60) X(144, tq2_t, 68)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
@@ -1045,7 +1112,7 @@ __device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u
 #endif
 }
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
-template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
+template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23 || (T >= 144 && T <= 151); }
 #if __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
@@ -1213,6 +1280,18 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         gemmi_q<T, SBB, 128, true>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                        \
     }
 ITYPES(DEF_GEMMI)
+
+// out[r] = H_128 (signs * x[r]) on each slice of 128 values (the normalised Walsh-Hadamard transform): the rotation of the
+// input of a Gyro tensor. grid (n / 128, rows), 128 threads; rows `xs` and `os` floats apart; in place when out == x.
+extern "C" __global__ void hadamard(const float* x, int xs, float* out, int os, const float* signs) {
+    __shared__ float v[128];
+    int o = blockIdx.x * 128 + threadIdx.x, j = threadIdx.x;
+    v[j] = x[(size_t)blockIdx.y * xs + o] * signs[o];
+    __syncthreads();
+    float a = 0;
+    for (int c = 0; c < 128; c++) a += (__popc(j & c) & 1) ? -v[c] : v[c];
+    out[(size_t)blockIdx.y * os + o] = a * 0.08838834764831845f;
+}
 
 // ---- elementwise / norm ----
 

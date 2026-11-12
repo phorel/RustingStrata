@@ -123,6 +123,9 @@ pub struct GpuModel<'a> {
     saved_ple_prev: [i64; 2],
     /// Scratch activations by name.
     bufs: HashMap<&'static str, Buf>,
+    /// Gyro rotation: the signs of the expert input (n_embd) and of the down input (n_ff_exp), and per layer whether
+    /// gate / up and down are stored rotated.
+    rot: Option<(Buf, Buf, Vec<(bool, bool)>)>,
     x: Buf,
     worker: Option<CpuWorker>,
     logits: Buf,
@@ -245,10 +248,23 @@ impl<'a> GpuModel<'a> {
         let cpu_only = |n: &str| n == "per_layer_token_embd.weight";
         let f32_up = |n: &str, ty| matches!(ty, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q5_0) && !n.contains("_exps.");
         if let Some(t) = m.w.g.tensors.values().find(|t| !cpu_only(&t.name)
-            && GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()) && !f32_up(&t.name, ty))) {
+            && !t.name.contains("_exps.") && GgmlType::from_u32(t.ty).is_ok_and(|ty| !ty.gpu(gpu.name()) && !f32_up(&t.name, ty))) {
             anyhow::bail!("tensor {} has type {}, which the {} backend does not support yet", t.name, GgmlType::from_u32(t.ty)?.name(), gpu.name());
         }
         let c = &m.cfg;
+        // ponytail: experts of a type without GPU kernels (Gyro trellis) all run on the CPU, and the prompt goes token
+        // by token, since the batched prefill computes experts on the GPU. Rotated tensors other than experts would
+        // need the rotation in the dense kernels.
+        let ex = |il: usize, i: usize| m.w.layer(il, crate::expert_cache::MATS[i]).ok();
+        let rot_ok = |r: &crate::quant::tq::Rot| gpu.name() == "cuda" && r.block == 128;
+        let cpu_exps = c.is_moe() && range.clone().any(|il| (0..3).any(|i| ex(il, i).is_some_and(|t| !t.ty.gpu(gpu.name()) || t.rot.is_some_and(|r| !rot_ok(&r)))));
+        let rot_layers: Vec<(bool, bool)> = range.clone().map(|il| (ex(il, 0).is_some_and(|t| t.rot.is_some()), ex(il, 2).is_some_and(|t| t.rot.is_some()))).collect();
+        ensure!(range.clone().all(|il| ex(il, 0).is_some_and(|t| t.rot.is_some()) == ex(il, 1).is_some_and(|t| t.rot.is_some())), "gate and up experts differ in rotation");
+        let rotated = !cpu_exps && rot_layers.iter().any(|r| r.0 || r.1);
+        if let Some(t) = m.w.g.tensors.values().find(|t| !t.name.contains("_exps.") && m.w.get(&t.name).is_ok_and(|t| t.rot.is_some())) {
+            anyhow::bail!("tensor {} is stored rotated, which only expert tensors may be", t.name);
+        }
+        let chunk = if cpu_exps { 0 } else { chunk };
         let up = |name: &str| -> anyhow::Result<GpuTensor> { gpu.upload(&m.w.get(name)?) };
         let lt = |il: usize, s: &str| up(&format!("blk.{il}.{s}"));
         let hc_read = |p: &str| -> anyhow::Result<HcRead> {
@@ -346,6 +362,7 @@ impl<'a> GpuModel<'a> {
             ("oq", c.ssm_d_inner * 9 / 32),
         ];
         if qsa_on { sizes.extend([("ik", QSA_D), ("iq", QSA_H * QSA_D), ("iqn", QSA_H * QSA_D)]); }
+        if rotated { sizes.extend([("hr", c.n_embd), ("hrq", c.n_embd * 9 / 32)]); }
         if c.hc_n > 0 {
             let d = c.hc_n * c.n_embd;
             sizes.extend([("xn", d), ("lo", c.hc_rank), ("hg", d), ("inj", c.hc_n), ("mo", c.n_embd),
@@ -382,8 +399,18 @@ impl<'a> GpuModel<'a> {
             // STRATA_EXPERT_MB caps the expert slots, so that runs place the same experts whatever VRAM is free (a
             // backend comparison, or other programs holding VRAM).
             let cap = std::env::var("STRATA_EXPERT_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |v| v << 20);
-            let budget = free1.saturating_sub(vram_margin).min(cap);
+            let budget = if cpu_exps { 0 } else { free1.saturating_sub(vram_margin).min(cap) };
             Some(ExpertCache::new(m, &*gpu, budget, range.start..range.end + mtp as usize)?)
+        } else { None };
+        let rot = if rotated {
+            let signs = |i: usize, n: usize| -> anyhow::Result<Buf> {
+                let s = range.clone().find_map(|il| ex(il, i)?.rot).map_or(vec![1f32; n], |r| r.signs.to_vec());
+                ensure!(s.len() == n, "Hadamard signs of {} values for an input of {n}", s.len());
+                let b = gpu.zeros::<f32>(n)?;
+                gpu.put(&s, &b, 0)?;
+                Ok(b)
+            };
+            Some((signs(0, c.n_embd)?, signs(2, c.n_ff_exp)?, rot_layers))
         } else { None };
         let worker = if c.is_moe() { Some(CpuWorker::new(m, &*gpu, range.clone().collect())?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
@@ -401,7 +428,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), ngram: (0, 0), snaps, split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, rot, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), ngram: (0, 0), snaps, split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -1106,7 +1133,10 @@ impl<'a> GpuModel<'a> {
                     let cache = self.cache.as_ref().unwrap();
                     let lx = cache.layer(il).unwrap();
                     let (base, stride) = cache.base(lx);
-                    let [mg, mu, md] = lx.mats;
+                    let [mut mg, mut mu, mut md] = lx.mats;
+                    // ponytail: a type without GPU kernels has no experts on the GPU (`cpu_exps` in `load_part`), so
+                    // every slot is -1 and the expert kernels of any type do nothing: launch the F32 ones.
+                    for t in [&mut mg, &mut mu, &mut md] { if !t.ty.gpu(g.name()) { t.ty = GgmlType::F32; } }
                     let slots = self.slots.addr();
                     let (mut sq, mut dq) = (0, 0);
                     let w = worker.unwrap();
@@ -1123,22 +1153,34 @@ impl<'a> GpuModel<'a> {
                         Ok(())
                     })?;
                     g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt)?;
+                    // Rotated experts (Gyro) take the rotated h, and their down the rotated activations.
+                    let (rs, (rgu, rd)) = self.rot.as_ref().map_or((None, (false, false)), |r| (Some((r.0.addr(), r.1.addr())), r.2[il - self.first]));
+                    if rgu {
+                        g.hadamard(p("h"), ne, p("hr"), ne, rs.unwrap().0, ne, nt)?;
+                        g.quant_xq(p("hr"), ne, ne, nt, p("hrq"))?;
+                    }
+                    let (hx, hxq) = if rgu { (p("hr"), p("hrq")) } else { (p("h"), p("hq")) };
                     g.batch(&mut || {
                         if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                             let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
-                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), Some(pair), p("hq"))?;
+                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, hx, ne, k, p("ge"), Some(pair), hxq)?;
                         } else {
-                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, p("h"), ne, k, p("ge"), None, p("hq"))?;
-                            g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, p("h"), ne, k, p("ue"), None, p("hq"))?;
+                            g.moe_gemv(mg.ty, mg.rows, mg.cols, base + mg.off as u64, stride, slots, kt, hx, ne, k, p("ge"), None, hxq)?;
+                            g.moe_gemv(mu.ty, mu.rows, mu.cols, base + mu.off as u64, stride, slots, kt, hx, ne, k, p("ue"), None, hxq)?;
                         }
                         if let Some(s) = shared { sq = sw(s.down.ty, "shg", "shu", c.n_ff_shexp, nt, "shq")?; }
                         Ok(())
                     })?;
                     g.batch(&mut || {
-                        dq = sw(md.ty, "ge", "ue", c.n_ff_exp, kt, "ffq")?;
+                        // A rotated down takes the activations as floats first: they are rotated, then quantized.
+                        if rd { g.swiglu(p("ge"), p("ue"), kt * c.n_ff_exp)?; } else { dq = sw(md.ty, "ge", "ue", c.n_ff_exp, kt, "ffq")?; }
                         if let Some(s) = shared { g.gemvq(&s.down, p("shg"), c.n_ff_shexp, sq, p("shy"), ne, nt)?; }
                         Ok(())
                     })?;
+                    if rd {
+                        g.hadamard(p("ge"), c.n_ff_exp, p("ge"), c.n_ff_exp, rs.unwrap().1, c.n_ff_exp, kt)?;
+                        if !matches!(md.ty, GgmlType::F32 | GgmlType::BF16) { g.quant_xq(p("ge"), c.n_ff_exp, c.n_ff_exp, kt, p("ffq"))?; dq = p("ffq"); }
+                    }
                     }
                     let (sh, sg) = if shared.is_some() { (p("shy"), p("sg")) } else { (0, 0) };
                     // Hyper-connections: the FFN output collects in "mo" (zero) and goes to the streams from there.

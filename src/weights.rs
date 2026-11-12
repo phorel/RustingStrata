@@ -2,7 +2,7 @@
 
 use crate::config::ModelConfig;
 use crate::gguf::Gguf;
-use crate::quant::{GgmlType, dequant_row};
+use crate::quant::{GgmlType, dequant_row, tq::Rot};
 use anyhow::Context;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -15,6 +15,8 @@ pub struct Tensor<'a> {
     /// Product of the remaining dims; for 3-D expert tensors this is out_rows * n_expert.
     pub rows: usize,
     pub data: &'a [u8],
+    /// Rows are stored in a rotated basis (Gyro files): `row` gives them back in the plain one.
+    pub rot: Option<Rot<'a>>,
 }
 
 impl<'a> Tensor<'a> {
@@ -23,6 +25,7 @@ impl<'a> Tensor<'a> {
     pub fn row(&self, r: usize, out: &mut [f32]) {
         let rb = self.row_bytes();
         dequant_row(self.ty, &self.data[r * rb..(r + 1) * rb], out);
+        if let Some(r) = &self.rot { r.unrotate(out); }
     }
 
     /// y[r] = row_r · x for all rows.
@@ -55,12 +58,15 @@ pub struct Weights<'a> {
     aliases: &'static [(&'static str, &'static str)],
     /// Tensors built at load time: qwen3next `ssm_ba` split into `ssm_beta` and `ssm_alpha`.
     built: HashMap<String, Tensor<'a>>,
+    /// Gyro block-Hadamard rotation (`prism.hadamard.*`): the tensors stored rotated, the signs per input width and
+    /// the block size.
+    rot: (std::collections::HashSet<String>, HashMap<usize, &'a [f32]>, usize),
 }
 
 impl<'a> Weights<'a> {
     pub fn new(g: &'a Gguf) -> anyhow::Result<Weights<'a>> {
         let c = ModelConfig::from_gguf(g)?;
-        let mut w = Weights { g, aliases: c.aliases, built: HashMap::new() };
+        let mut w = Weights { g, aliases: c.aliases, built: HashMap::new(), rot: Self::rotation(g)? };
         // llama.cpp src/models/qwen3next.cpp: per key head group, r = nv / nk beta rows, then r alpha rows.
         for il in 0..c.n_layer {
             let Ok(ba) = w.layer(il, "ssm_ba.weight") else { continue };
@@ -94,10 +100,41 @@ impl<'a> Weights<'a> {
             cols: t.dims[0] as usize,
             rows: t.dims[1..].iter().product::<u64>() as usize,
             data: self.g.bytes(t),
+            rot: if self.rot.0.contains(&t.name) {
+                let signs = self.rot.1.get(&(t.dims[0] as usize)).with_context(|| format!("tensor {name}: no Hadamard signs for width {}", t.dims[0]))?;
+                Some(Rot { signs, block: self.rot.2 })
+            } else { None },
         })
     }
 
     pub fn layer(&self, il: usize, suffix: &str) -> anyhow::Result<Tensor<'a>> { self.get(&format!("blk.{il}.{suffix}")) }
+
+    /// The rotation metadata of a Gyro file (agention-gyro specification, section 8.3), empty for other files.
+    fn rotation(g: &'a Gguf) -> anyhow::Result<(std::collections::HashSet<String>, HashMap<usize, &'a [f32]>, usize)> {
+        let key = |k: &str| g.meta.get(&format!("prism.hadamard.{k}"));
+        let Some(names) = key("weight_names").and_then(|v| v.as_arr()) else { return Ok(Default::default()) };
+        let s = |k: &str| key(k).and_then(|v| v.as_str()).unwrap_or("");
+        let block = key("block_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        anyhow::ensure!(key("version").and_then(|v| v.as_u64()) == Some(1) && s("transform") == "normalized-sylvester-walsh-hadamard"
+            && s("axis") == "input-last-dimension" && block.is_power_of_two() && ["explicit", "identity"].contains(&s("sign_mode"))
+            && ["inverse_weight_names", "tied_output", "gdn_v_grouped"].iter().all(|k| key(k).is_none()),
+            "unsupported prism.hadamard rotation metadata");
+        let int = |v: &crate::gguf::Value| match *v { crate::gguf::Value::I32(x) => Some(x as i64), _ => v.as_u64().map(|x| x as i64) };
+        let widths: Vec<usize> = key("sign_widths").and_then(|v| v.as_arr()).unwrap_or(&[]).iter().filter_map(int).map(|w| w as usize).collect();
+        let values: Vec<f32> = key("sign_values").and_then(|v| v.as_arr()).unwrap_or(&[]).iter().filter_map(int).map(|x| x as f32).collect();
+        anyhow::ensure!(values.len() == widths.iter().sum::<usize>() && values.iter().all(|v| v.abs() == 1.0) && widths.iter().all(|w| w % block == 0),
+            "bad prism.hadamard signs");
+        let names: std::collections::HashSet<String> = names.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        let mut signs = HashMap::new();
+        if s("sign_mode") == "identity" {
+            for n in &names { if let Some(t) = g.tensors.get(n) { signs.entry(t.dims[0] as usize).or_insert_with(|| &*Box::leak(vec![1f32; t.dims[0] as usize].into_boxed_slice())); } }
+        } else {
+            let mut o = 0;
+            // ponytail: leaked, a few KB per load (as the ssm_ba halves below).
+            for w in widths { signs.insert(w, &*Box::leak(values[o..o + w].to_vec().into_boxed_slice())); o += w; }
+        }
+        Ok((names, signs, block))
+    }
 
     /// Refuse files containing quant types this engine does not implement, except in the MTP (nextn) layers, blocks
     /// `n_layer` on: false if one of those has such a type, so that the model loads without MTP.

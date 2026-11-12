@@ -470,6 +470,35 @@ mod avx2 {
         }
     }
 
+    /// TQ2_T and TQK4-TQK7 (scalar `dot_tq`): four states' weights (16 int16) against 16 activations per madd.
+    pub fn dot_tq<const K: usize>(row: &[u8], xq: &[Q8K]) -> f32 {
+        let tab = super::TQ_STATES.as_ptr();  // of the Vec, through the LazyLock
+        unsafe {
+            let mut acc = _mm256_setzero_ps();
+            for (i, b) in row.chunks_exact(2 + 4 * K).enumerate() {
+                let (y, o) = (&xq[i / 2], i % 2 * 128);
+                // A state is one unaligned load from the stream where its bytes do not wrap past the block's end
+                // (reading through a copy with the start repeated was 45% slower on one thread).
+                let qs = &b[2..];
+                let st = |t: usize| {
+                    if K == 8 { return if t == 0 { (qs[31] as usize) << 8 | qs[0] as usize } else { u16::from_be((qs.as_ptr().add(t - 1) as *const u16).read_unaligned()) as usize } & 0x7FFF; }
+                    let off = (31 - t) * K;
+                    if (off >> 3) + 4 > 4 * K { return crate::quant::tq::state(qs, K, 32, t) & 0x7FFF; }
+                    ((qs.as_ptr().add(off >> 3) as *const u32).read_unaligned() >> (off & 7)) as usize & 0x7FFF
+                };
+                let mut sumi = _mm256_setzero_si256();
+                for g in 0..8 {
+                    let l = |t: usize| (tab.add(st(t)) as *const i64).read_unaligned();
+                    let w = _mm256_set_epi64x(l(4 * g + 3), l(4 * g + 2), l(4 * g + 1), l(4 * g));
+                    let x = _mm256_cvtepi8_epi16(_mm_loadu_si128(y.qs.as_ptr().add(o + 16 * g) as *const __m128i));
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(w, x));
+                }
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+            }
+            hsum(acc) / super::TQ_SCALE
+        }
+    }
+
     /// Pair sums `p` (16 i16) times `lo` (first 8, values 0..16) and `hi` (last 8), summed into 8 i32.
     #[inline(always)]
     unsafe fn udot_scale(p: __m256i, lo: i32, hi: i32) -> __m256i { unsafe {
@@ -775,18 +804,40 @@ mod avx2 {
     }
 }
 
+/// Gyro trellis types with four weights per step: the weights of each 15-bit state as int16, scaled by `TQ_SCALE`
+/// (the codebook is within ±4).
+static TQ_STATES: std::sync::LazyLock<Vec<[i16; 4]>> = std::sync::LazyLock::new(|| {
+    use crate::quant::tq::{cb, index};
+    (0..1usize << 15).map(|s| { let (a, b) = index(s); [2 * a, 2 * a + 1, 2 * b, 2 * b + 1].map(|i| (cb(i) * TQ_SCALE).round() as i16) }).collect()
+});
+const TQ_SCALE: f32 = 8192.0;
+
+/// TQ2_T (`K` = 8) and TQK4-TQK7: 128 values d * codebook per block of 2 + 4 K bytes, two blocks per Q8_K block.
+fn dot_tq<const K: usize>(row: &[u8], xq: &[Q8K]) -> f32 {
+    let tab = &**TQ_STATES;
+    row.chunks_exact(2 + 4 * K).enumerate().map(|(i, b)| {
+        let (y, o) = (&xq[i / 2], i % 2 * 128);
+        let s: i32 = (0..32).map(|t| {
+            let w = tab[crate::quant::tq::state(&b[2..], K, 32, t) & 0x7FFF];
+            (0..4).map(|j| w[j] as i32 * y.qs[o + 4 * t + j] as i32).sum::<i32>()
+        }).sum();
+        d16(b) * y.d * s as f32
+    }).sum::<f32>() / TQ_SCALE
+}
+
 fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(target_feature = "avx2")]
     if std::env::var_os("STRATA_SCALAR").is_none() {
-        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ4NL => Some(avx2::dot_iq4nl), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q5K => Some(avx2::dot_q5k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::Q4_0 => Some(avx2::dot_q4::<2>), GgmlType::Q4_1 => Some(avx2::dot_q4::<3>), GgmlType::Q5_0 => Some(avx2::dot_q4::<6>), GgmlType::Q5_1 => Some(avx2::dot_q4::<7>), _ => None };
+        return match ty { GgmlType::IQ2XS => Some(avx2::dot_iq2xs), GgmlType::IQ3XXS => Some(avx2::dot_iq3xxs), GgmlType::IQ4XS => Some(avx2::dot_iq4xs), GgmlType::IQ4NL => Some(avx2::dot_iq4nl), GgmlType::TQK4 => Some(avx2::dot_tq::<4>), GgmlType::TQK5 => Some(avx2::dot_tq::<5>), GgmlType::TQK6 => Some(avx2::dot_tq::<6>), GgmlType::TQK7 => Some(avx2::dot_tq::<7>), GgmlType::TQ2T => Some(avx2::dot_tq::<8>), GgmlType::IQ3S => Some(avx2::dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(avx2::dot_iq2xxs), GgmlType::IQ2S => Some(avx2::dot_iq2s), GgmlType::IQ1S => Some(avx2::dot_iq1s), GgmlType::IQ1M => Some(avx2::dot_iq1m), GgmlType::Q2K => Some(avx2::dot_q2k), GgmlType::Q3K => Some(avx2::dot_q3k), GgmlType::Q4K => Some(avx2::dot_q4k), GgmlType::Q5K => Some(avx2::dot_q5k), GgmlType::Q2_0 => Some(avx2::dot_q2_0), GgmlType::Q4_0 => Some(avx2::dot_q4::<2>), GgmlType::Q4_1 => Some(avx2::dot_q4::<3>), GgmlType::Q5_0 => Some(avx2::dot_q4::<6>), GgmlType::Q5_1 => Some(avx2::dot_q4::<7>), _ => None };
     }
-    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ4NL => Some(dot_iq4nl), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q5K => Some(dot_q5k), GgmlType::Q2_0 => Some(dot_q2_0), GgmlType::Q4_0 => Some(dot_q4::<2>), GgmlType::Q4_1 => Some(dot_q4::<3>), GgmlType::Q5_0 => Some(dot_q4::<6>), GgmlType::Q5_1 => Some(dot_q4::<7>), _ => None }
+    match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ4NL => Some(dot_iq4nl), GgmlType::TQK4 => Some(dot_tq::<4>), GgmlType::TQK5 => Some(dot_tq::<5>), GgmlType::TQK6 => Some(dot_tq::<6>), GgmlType::TQK7 => Some(dot_tq::<7>), GgmlType::TQ2T => Some(dot_tq::<8>), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q5K => Some(dot_q5k), GgmlType::Q2_0 => Some(dot_q2_0), GgmlType::Q4_0 => Some(dot_q4::<2>), GgmlType::Q4_1 => Some(dot_q4::<3>), GgmlType::Q5_0 => Some(dot_q4::<6>), GgmlType::Q5_1 => Some(dot_q4::<7>), _ => None }
 }
 
 /// y = t · x for every row, using the integer kernel when the type has one.
 pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
     let Some(dot) = int_dot(t.ty) else { return t.matvec(x, y) };
-    let xq = quantize_q8k(x);
+    // The kernels read the stored rows, so a rotated tensor takes the rotated x.
+    let xq = match &t.rot { Some(r) => quantize_q8k(&r.rotate(x)), None => quantize_q8k(x) };
     let rb = t.data.len() / t.rows;
     y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
         for (k, v) in ys.iter_mut().enumerate() {
@@ -801,7 +852,9 @@ pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
 fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
     let rows = out.len() / mats.len();
     let dot = int_dot(mats[0].ty);
-    let xq: Vec<Vec<Q8K>> = if dot.is_some() { xs.iter().map(|x| quantize_q8k(x)).collect() } else { vec![] };
+    let xq: Vec<Vec<Q8K>> = if dot.is_none() { vec![] } else {
+        xs.iter().map(|x| match &mats[0].rot { Some(r) => quantize_q8k(&r.rotate(x)), None => quantize_q8k(x) }).collect()
+    };
     out.par_chunks_mut(16).enumerate().for_each_init(|| vec![0f32; mats[0].cols], |buf, (c, ys)| {
         for (k, v) in ys.iter_mut().enumerate() {
             let i = c * 16 + k;
@@ -851,7 +904,7 @@ mod tests {
         let mut r = 0x9E3779B97F4A7C15u64;
         let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
         let x: Vec<f32> = (0..1024).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
-        for ty in [GgmlType::Q2_0, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::IQ4NL, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q5K, GgmlType::IQ2XXS, GgmlType::IQ2S, GgmlType::IQ1S, GgmlType::IQ1M] {
+        for ty in [GgmlType::Q2_0, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4XS, GgmlType::IQ4NL, GgmlType::TQK4, GgmlType::TQK5, GgmlType::TQK6, GgmlType::TQK7, GgmlType::TQ2T, GgmlType::Q6K, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q5K, GgmlType::IQ2XXS, GgmlType::IQ2S, GgmlType::IQ1S, GgmlType::IQ1M] {
             // Q2_0 at 640 values exercises the zero-padded last Q8_K block.
             let n = if ty == GgmlType::Q2_0 { 640 } else { 1024 };
             let xq = quantize_q8k(&x[..n]);
@@ -867,9 +920,11 @@ mod tests {
             let mut w = vec![0f32; n];
             crate::quant::dequant_row(ty, &row, &mut w);
             let want: f64 = w.iter().enumerate().map(|(i, &v)| v as f64 * (xq[i / 256].d * xq[i / 256].qs[i % 256] as f32) as f64).sum();
-            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, GgmlType::Q5K => dot_q5k, GgmlType::IQ2XXS => dot_iq2xxs, GgmlType::IQ2S => dot_iq2s, GgmlType::IQ1S => dot_iq1s, GgmlType::IQ1M => dot_iq1m, GgmlType::Q2_0 => dot_q2_0, GgmlType::Q4_0 => dot_q4::<2>, GgmlType::Q4_1 => dot_q4::<3>, GgmlType::Q5_0 => dot_q4::<6>, GgmlType::Q5_1 => dot_q4::<7>, GgmlType::IQ4NL => dot_iq4nl, _ => dot_iq4xs };
+            let scalar = match ty { GgmlType::IQ2XS => dot_iq2xs, GgmlType::IQ3XXS => dot_iq3xxs, GgmlType::IQ3S => dot_iq3s, GgmlType::Q6K => dot_q6k, GgmlType::Q2K => dot_q2k, GgmlType::Q3K => dot_q3k, GgmlType::Q4K => dot_q4k, GgmlType::Q5K => dot_q5k, GgmlType::IQ2XXS => dot_iq2xxs, GgmlType::IQ2S => dot_iq2s, GgmlType::IQ1S => dot_iq1s, GgmlType::IQ1M => dot_iq1m, GgmlType::Q2_0 => dot_q2_0, GgmlType::Q4_0 => dot_q4::<2>, GgmlType::Q4_1 => dot_q4::<3>, GgmlType::Q5_0 => dot_q4::<6>, GgmlType::Q5_1 => dot_q4::<7>, GgmlType::IQ4NL => dot_iq4nl, GgmlType::TQK4 => dot_tq::<4>, GgmlType::TQK5 => dot_tq::<5>, GgmlType::TQK6 => dot_tq::<6>, GgmlType::TQK7 => dot_tq::<7>, GgmlType::TQ2T => dot_tq::<8>, _ => dot_iq4xs };
             for got in [scalar(&row, &xq), int_dot(ty).unwrap()(&row, &xq)] {
-                assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
+                // The trellis kernels round the codebook to int16.
+                let tol = if ty.tq().is_some() { 5e-4 } else { 1e-5 };
+                assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < tol, "{}: {got} vs {want}", ty.name());
             }
         }
     }

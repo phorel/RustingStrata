@@ -13,7 +13,7 @@ const STAGE: usize = 16;
 
 /// Float offsets into the scratch slab (each region holds `chunk` rows). Mixer and FFN regions alias, and so do the
 /// hyper-connection read and PLE temporaries (`xn` .. `pv`), which run outside both.
-struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize,
+struct Lay { h: usize, a: usize, b: usize, c: usize, d: usize, e: usize, rl: usize, wts: usize, ge: usize, ye: usize, shg: usize, shy: usize, sg: usize, hr: usize,
              xn: usize, lo: usize, hg: usize, pk: usize, pq: usize, pg: usize, pn: usize, pv: usize, inj: usize, mix: usize, mo: usize, emb: usize }
 
 pub(super) struct Scratch {
@@ -49,6 +49,8 @@ impl Scratch {
         let mut take = |n: usize| { let o = at; at += n * chunk; o };
         let (rl, wts, ge) = (take(c.n_expert), take(k), take((k * c.n_ff_exp).max(c.n_ff)));
         let (ye, shg, shy, sg) = (take(k * ne), take(c.n_ff_shexp), take(ne), take(1));
+        // The rotated h of Gyro experts.
+        let hr = if c.is_moe() && (0..c.n_layer).any(|il| m.w.layer(il, MATS[0]).is_ok_and(|t| t.rot.is_some())) { take(ne) } else { 0 };
         let mut total = at.max(mix_end);
         let (mut xn, mut lo, mut hg, mut pk, mut pq, mut pg, mut pn, mut pv, mut inj, mut mix, mut mo, mut emb) = Default::default();
         if c.hc_n > 0 {
@@ -62,7 +64,7 @@ impl Scratch {
         }
         let n_tiles = 3 * (chunk * k / GEMM_BM + 2 * c.n_expert);
         Ok(Scratch {
-            chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
+            chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, hr, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
             slab: gpu.zeros::<f32>(total)?, ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
         })
@@ -421,13 +423,20 @@ impl GpuModel<'_> {
                     // Per step: the gate and up tiles of all its groups (one launch each: more blocks, less tail), then
                     // per group its down tiles and the slot rows lo..hi it covers. The down GEMM reads rows lo..hi of
                     // `ge` only, so its tiles count from lo and it quantizes just those rows.
+                    // Rotated experts (Gyro) take the rotated h, and their down the rotated activations: per group the
+                    // runs of slot rows that are its own (lo..hi also spans the rows of other groups' experts).
+                    let (rs, (rgu, rd)) = self.rot.as_ref().map_or((None, (false, false)), |r| (Some((r.0.addr(), r.1.addr())), r.2[il - self.first]));
                     let mut spans = Vec::new();
                     for (gs, _) in &steps {
                         let gu = [0, 1].map(|mi| { let s = tiles.len() / 2; for gi in gs.clone() { push(&mut tiles, &groups[gi], mi, 0); } (s, tiles.len() / 2 - s) });
                         let downs: Vec<_> = gs.clone().filter(|&gi| !groups[gi].is_empty()).map(|gi| {
                             let grp = &groups[gi];
                             let (lo, hi) = (off[grp[0].0], off[grp[grp.len() - 1].0 + 1]);
-                            (push(&mut tiles, grp, 2, lo), lo, hi)
+                            let mut runs: Vec<(usize, usize)> = Vec::new();
+                            for &(e, _) in grp.iter().filter(|_| rd) {
+                                match runs.last_mut() { Some(r) if r.1 == off[e] => r.1 = off[e + 1], _ => runs.push((off[e], off[e + 1])) }
+                            }
+                            (push(&mut tiles, grp, 2, lo), lo, hi, runs)
                         }).collect();
                         spans.push((gu, downs));
                     }
@@ -436,6 +445,8 @@ impl GpuModel<'_> {
                     let tp = |s: usize| pf.tiles.addr() + 16 * s as u64;
                     let xrow_d = pf.ints.addr() + 4 * (n * k) as u64;
                     let [mg, mu, md] = lx.mats;
+                    if rgu { g.hadamard(h, ne, at(l.hr), ne, rs.unwrap().0, ne, t)?; }
+                    let hx = if rgu { at(l.hr) } else { h };
                     let copy = |j: usize| -> anyhow::Result<()> {
                         let grp = &staged[j];
                         for (name, mat) in MATS.iter().zip(&lx.mats) {
@@ -454,10 +465,11 @@ impl GpuModel<'_> {
                     for ((_, cp), (gu, downs)) in steps.iter().zip(&spans) {
                         g.beside(&mut || {
                             if gu[0].1 > 0 {
-                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
-                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, h, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
+                                g.gemm(mg.ty, mg.rows, mg.cols, tp(gu[0].0), gu[0].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, SAME_X)?;
+                                g.gemm(mu.ty, mu.rows, mu.cols, tp(gu[1].0), gu[1].1, hx, ne, t, xrow_d, at(l.ge), c.n_ff_exp, 1 | SAME_X)?;
                             }
-                            for &((s0, n0), lo, hi) in downs {
+                            for &((s0, n0), lo, hi, ref runs) in downs {
+                                for &(a, b) in runs { let ge = at(l.ge) + (4 * a * c.n_ff_exp) as u64; g.hadamard(ge, c.n_ff_exp, ge, c.n_ff_exp, rs.unwrap().1, c.n_ff_exp, b - a)?; }
                                 g.gemm(md.ty, md.rows, md.cols, tp(s0), n0, at(l.ge) + (4 * lo * c.n_ff_exp) as u64, c.n_ff_exp, hi - lo, 0, at(l.ye) + (4 * lo * ne) as u64, ne, 0)?;
                             }
                             if let Some(j) = *cp { copy(j)?; }
