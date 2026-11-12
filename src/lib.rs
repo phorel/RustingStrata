@@ -1,3 +1,4 @@
+pub mod memory;
 pub mod config;
 pub mod gguf;
 pub mod quant;
@@ -15,3 +16,6 @@ pub mod cpu_worker;
 pub mod serve;
 pub mod chat;
 pub mod hf;
+pub mod deepseek;
+pub mod gemma4;
+pub mod glm;

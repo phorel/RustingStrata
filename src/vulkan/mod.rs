@@ -10,6 +10,9 @@ use ash::vk;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub mod preflight;
+pub mod spv_smem;
+
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
 /// Staged copies are submitted once this many bytes are queued: a submit per expert matrix costs more than the copy.
@@ -138,6 +141,8 @@ struct Inner {
     tsem: vk::Semaphore,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
+    /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
+    wave64: bool,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
     coop: bool,
     /// Without cooperative matrices: run the tiled `attn_prefill_tile` (one KV-head tile shared by 32 query/head tasks)
@@ -156,6 +161,9 @@ struct Inner {
     llama: u32,
     /// Specialization constant 15 of every kernel: q8 KV cache rows (`--kv q8`, KV_Q8 in common.glsl).
     kv_q8: bool,
+    /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
+    /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
+    smem_limit: u32,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -283,8 +291,9 @@ fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> 
     let p = p2.properties;
     if p.device_type == vk::PhysicalDeviceType::CPU { return Some("a CPU device".into()); }
     if p.api_version < vk::API_VERSION_1_3 { return Some("Vulkan 1.3 is needed".into()); }
-    if !(sg.min_subgroup_size..=sg.max_subgroup_size).contains(&32) || !sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE) {
-        return Some(format!("subgroup size 32 is needed (it has {}-{})", sg.min_subgroup_size, sg.max_subgroup_size));
+    if !((sg.min_subgroup_size..=sg.max_subgroup_size).contains(&32) && sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE))
+        && !(sg.min_subgroup_size == 64 && sg.max_subgroup_size == 64 && p11.subgroup_size == 64) {
+        return Some(format!("subgroup size 32 or fixed size 64 is needed (it has {}-{})", sg.min_subgroup_size, sg.max_subgroup_size));
     }
     let ops = vk::SubgroupFeatureFlags::ARITHMETIC | vk::SubgroupFeatureFlags::SHUFFLE;
     if !p11.subgroup_supported_operations.contains(ops) || !p11.subgroup_supported_stages.contains(vk::ShaderStageFlags::COMPUTE) {
@@ -336,6 +345,9 @@ impl Vk {
         };
         eprintln!("vulkan device {device}: {name}");
         // ponytail: the instance leaks if device setup below fails; it is a one-time startup error.
+        let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut sg)) };
+        let wave64 = sg.min_subgroup_size == 64;
         let qf = unsafe { instance.get_physical_device_queue_family_properties(pd) }.iter()
             .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE)).context("no compute queue")? as u32;
         let dexts = unsafe { instance.enumerate_device_extension_properties(pd) }?;
@@ -350,7 +362,7 @@ impl Vk {
             .unwrap_or_default() } else { vec![] };
         let shape = |k, ab, cr| props.iter().any(|c| (c.m_size, c.n_size, c.k_size) == (16, 16, k) && c.scope == vk::ScopeKHR::SUBGROUP
             && c.a_type == ab && c.b_type == ab && c.c_type == cr && c.result_type == cr);
-        let coop = shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
+        let coop = !wave64 && shape(16, vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
             && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
         let coop_i8 = coop && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
         // The tiled fallback needs a 1024-thread workgroup and 32 KB of shared memory (see attn_prefill_tile.comp).
@@ -405,6 +417,17 @@ impl Vk {
         let csem = unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut sti), None) }?;
         let tsem = unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut sti), None) }?;
         let mem = unsafe { instance.get_physical_device_memory_properties(pd) };
+        // Workgroup shared memory of a pipeline may not exceed this. Volta has 48 KB: gemmi_dp's KS = 16
+        // specialization needs exactly 49152 (the 49168-byte request of the pre-fix gemmi_dp crossed it and lost the
+        // device with Xid 13). STRATA_VK_SMEM_LIMIT pretends the device reports another value, so a test can exercise
+        // the refusal without a doctored shader.
+        let mut smem_limit = unsafe { instance.get_physical_device_properties(pd) }.limits.max_compute_shared_memory_size;
+        // The AMD proprietary driver on Windows reports 32768 on RDNA3/4 cards (cooperative matrices), which really have
+        // 64 KB (issue #20; vulkaninfo agrees with the driver, Linux RADV reports 65536). No kernel needs more than 49152.
+        let mut drv = vk::PhysicalDeviceDriverProperties::default();
+        unsafe { instance.get_physical_device_properties2(pd, &mut vk::PhysicalDeviceProperties2::default().push_next(&mut drv)) };
+        if drv.driver_id == vk::DriverId::AMD_PROPRIETARY && coop && smem_limit == 32768 { smem_limit = 49152; }
+        if let Ok(v) = std::env::var("STRATA_VK_SMEM_LIMIT") { smem_limit = v.parse().context("STRATA_VK_SMEM_LIMIT")?; }
         let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(qf);
         let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
         let gpool = unsafe { dev.create_command_pool(&pool_info, None) }?;
@@ -416,7 +439,7 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -444,8 +467,8 @@ impl Vk {
         let s = |c: &[std::ffi::c_char]| unsafe { std::ffi::CStr::from_ptr(c.as_ptr()) }.to_string_lossy().into_owned();
         let yn = |b: bool| if b { "yes" } else { "no" };
         let amd = if v.0.amd_plain || v.0.amd_coherent { format!(", device-coherent memory {}", yn(v.0.amd_coherent)) } else { String::new() };
-        eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}", s(&drv.driver_name),
-            s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond));
+        eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}, maxComputeSharedMemorySize {}",
+            s(&drv.driver_name), s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond), v.0.smem_limit);
         if !v.0.coop { eprintln!("vulkan: prefill attention: {} (no cooperative matrices)", if v.0.dp_tile { "tiled" } else { "per-query" }); }
         Ok(v)
     }
@@ -680,16 +703,19 @@ impl Inner {
     fn pipeline(&self, st: &mut State, name: &'static str, spec: &[u32]) -> anyhow::Result<vk::Pipeline> {
         if let Some(&p) = st.pipes.get(&(name, spec.to_vec())) { return Ok(p); }
         let code = SPV.iter().find(|s| s.0 == name).with_context(|| format!("no Vulkan kernel {name}"))?.1;
+        // One choke point for Workgroup shared memory: the driver creates such a pipeline and faults at dispatch.
+        spv_smem::check_shared_memory(name, spec, self.kv_q8, self.smem_limit)?;
         let words = ash::util::read_spv(&mut std::io::Cursor::new(code))?;
         let m = unsafe { self.dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }?;
         let n = spec.len() as u32;
         let entries: Vec<_> = (0..n).map(|i| vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4))
-            .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4)]).collect();
-        let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32)]).flat_map(|v| v.to_le_bytes()).collect();
+            .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4),
+                    vk::SpecializationMapEntry::default().constant_id(14).offset(4 * n + 4).size(4)]).collect();
+        let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32), &(self.wave64 as u32)]).flat_map(|v| v.to_le_bytes()).collect();
         let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
         let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
-        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main")
-            .specialization_info(&si).flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut sub);
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main").specialization_info(&si);
+        let stage = if self.wave64 { stage } else { stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut sub) };
         let r = unsafe { self.dev.create_compute_pipelines(vk::PipelineCache::null(),
             &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)
                 .flags(if self.stats { vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR } else { vk::PipelineCreateFlags::empty() })], None) };
@@ -802,6 +828,20 @@ impl Vk {
 }
 
 impl Vk {
+    /// Quantize `x` for the int8 GEMM, unless the cache already holds the same rows; `None` when `ty` or `cols`
+    /// selects the f16 path. Shared by `gemm_raw` and `prequant_gemm_x`.
+    fn q8_x(&self, q8: &mut (Buf, Option<[u64; 4]>), ty: GgmlType, cols: usize, n_x: usize, x: u64, x_stride: usize) -> anyhow::Result<Option<u64>> {
+        if !crate::cuda::Gpu::mmq(ty) || !cols.is_multiple_of(128) { return Ok(None); }
+        let key = Some([x, x_stride as u64, n_x as u64, cols as u64]);
+        if q8.1 == key { return Ok(Some(q8.0.addr())); }
+        let need = n_x * (cols + cols / 8 + cols / 4);
+        if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
+        let xq = q8.0.addr();
+        self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
+        q8.1 = key;
+        Ok(Some(xq))
+    }
+
     /// `gemm` over a tile list, or (tiles = 0) the dense matrix `wd` over positions 0 .. nd; as `gemm_raw` in
     /// src/cuda/mod.rs, with the same choice of f16 or int8 products (`Gpu::mmq`).
     fn gemm_raw(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, wd: u64, nd: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
@@ -831,14 +871,7 @@ impl Vk {
             if self.0.coop && tiles != 0 { self.run("gemm_fs", &spec, grid, &args)?; }
             return Ok(());
         }
-        let need = n_x * (cols + cols / 8 + cols / 4);
-        if q8.0.len() < need { q8.0 = self.alloc(need)?; }  // dropping the old buffer waits for work that uses it
-        let xq = q8.0.addr();
-        if !reuse {
-            ensure!(!self.0.st().batch, "gemm inside batch: x must be quantized already (SAME_X)");
-            self.run("quant_q8", &[self.0.llama], [n_x, 1, 1], &[&x, &xq, &(x_stride as u32), &(cols as u32)])?;
-            q8.1 = key;
-        }
+        let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
         let args: [&dyn Arg; 10] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2]];
         self.run(if !self.0.coop_i8 { "gemmi_dp" } else if sm { "gemmi_s" } else { "gemmi" }, &spec, grid, &args)?;
         if self.0.coop_i8 && tiles != 0 { self.run("gemmi_s", &spec, grid, &args)?; }
@@ -1045,6 +1078,7 @@ impl Backend for Vk {
         let (b, p) = self.buf(4 * words.max(1), if self.0.amd_coherent { BAR_AMD } else { BAR })?;
         Ok((b, p.cast()))
     }
+    fn preflight(&self, types: &[GgmlType], verbose: bool) -> anyhow::Result<()> { Vk::preflight(self, types, verbose) }
     fn kv_words(&self, n: usize) -> usize { if self.0.kv_q8 { n * 17 / 32 } else { n } }
 
     fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
@@ -1052,6 +1086,13 @@ impl Backend for Vk {
     }
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()> {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(128), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
+    }
+    fn int8_gemm(&self, ty: GgmlType) -> bool { crate::cuda::Gpu::mmq(ty) }
+
+    fn prequant_gemm_x(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize) -> anyhow::Result<()> {
+        let mut q8 = self.3.lock().unwrap();
+        self.q8_x(&mut q8, w.ty, w.cols, n, x, x_stride)?;
+        Ok(())
     }
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()> { self.gemvq(w, x, 0, 0, y, 0, 1) }
     fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
@@ -1227,7 +1268,8 @@ impl Backend for Vk {
         ensure!(n <= 512 && k <= 32, "router_topk: {n} experts, top {k}");
         self.run("router_topk", &[], [t, 1, 1], &[&p, &ids, &wts, &(n as u32), &(k as u32), &extra_scale])
     }
-    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
+    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64) -> anyhow::Result<()> {
+        debug_assert_eq!(pid, 0, "the Vulkan backend has no next-layer prefetch");
         ensure!(n <= 512 && k <= 32, "moe_route: {n} experts, top {k}");
         self.run("moe_route", &[], [1, 1, 1], &[&p, &table, &ids, &wts, &slots, &wh, &h, &mb, &step, &(n as u32), &(k as u32), &extra_scale, &(nh as u32), &(h_off as u32), &(t as u32)])
     }

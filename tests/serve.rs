@@ -15,7 +15,7 @@ fn prompts_match_llama_cpp() {
         for (case, body) in &reqs {
             let q = chat_request(body.dump().as_bytes());
             match want[case].as_str() {
-                Some(w) => { let q = q.unwrap(); assert_eq!(tpl.render(&q.messages, &q.tools, q.think, false, true), w, "{name} {case}") }
+                Some(w) => { let q = q.unwrap(); assert_eq!(tpl.render(&q.messages, &q.tools, q.think.unwrap_or(false), false, true), w, "{name} {case}") }
                 None => assert!(q.is_err(), "{name} {case} should be rejected"),
             }
         }
@@ -134,7 +134,7 @@ fn parses_request() {
     assert_eq!((r.method.as_str(), r.path.as_str(), r.host.as_str(), r.json), ("POST", "/v1/chat/completions", "x", true));
     let q = chat_request(&r.body).unwrap();
     assert_eq!(q.messages, vec![Msg::new("user", "a\nb")]);
-    assert!(q.stream && !q.think);
+    assert!(q.stream && q.think.is_none());
     assert_eq!(q.max_tokens, Some(7));
     assert_eq!((q.temperature, q.top_k, q.top_p, q.seed), (Some(0.7), None, Some(0.8), Some(5)));
     assert!(chat_request(br#"{"messages":[]}"#).is_err());
@@ -157,9 +157,13 @@ fn parses_request() {
 
 #[test]
 fn rejects_bad_hosts_and_huge_headers() {
-    assert!(host_ok("localhost:8080", "127.0.0.1:8080") && host_ok("127.0.0.1", "127.0.0.1:8080") && host_ok("[::1]:9", "x:1"));
-    assert!(host_ok("box.lan:8080", "box.lan:8080"));
-    assert!(!host_ok("evil.example:8080", "127.0.0.1:8080") && !host_ok("", "127.0.0.1:8080"));
+    assert!(host_ok("localhost:8080", "127.0.0.1:8080", &[]) && host_ok("127.0.0.1", "127.0.0.1:8080", &[]) && host_ok("[::1]:9", "x:1", &[]));
+    assert!(host_ok("box.lan:8080", "box.lan:8080", &[]));
+    assert!(!host_ok("evil.example:8080", "127.0.0.1:8080", &[]) && !host_ok("", "127.0.0.1:8080", &[]));
+    let lan = ["ai-server.lan".to_string()];
+    assert!(host_ok("ai-server.lan:8080", "0.0.0.0:8080", &lan));
+    assert!(host_ok("AI-SERVER.LAN.:8080", "0.0.0.0:8080", &lan));
+    assert!(!host_ok("evil.example:8080", "0.0.0.0:8080", &lan) && !host_ok("ai-server.lan.evil:8080", "0.0.0.0:8080", &lan));
     let raw = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(70_000));
     assert!(read_request(&mut raw.as_bytes()).is_err());
     let bad = |raw: &str| read_request(&mut raw.as_bytes()).err().map(|e| e.to_string());
@@ -323,6 +327,33 @@ fn per_key_holds() {
     assert!(open.lock().unwrap().is_empty());
 }
 
+/// A server with no keys checks `Host`; `--allowed-hosts` adds a LAN name without opening it to other names.
+#[test]
+fn serve_allows_configured_host_names() {
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("strata-host-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--addr", &addr, "--allowed-hosts", "ai-server.lan"])
+        .arg("--models-dir").arg(&dir)
+        .env_remove("STRATA_API_KEY").env_remove("STRATA_ALLOWED_HOSTS")
+        .stderr(std::process::Stdio::null()).spawn().unwrap();
+    let get = |host: &str| -> String {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        c.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        s.lines().next().unwrap_or_default().to_string()
+    };
+    assert!(get("ai-server.lan:8080").contains("200"));
+    assert!(get("evil.example:8080").contains("403"));
+    let _ = p.kill();
+    let _ = p.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `strata serve` without a model, over HTTP: what the connection threads answer before the queue, a customer key
 /// refused an admin route by `handle`, and a SIGTERM that exits.
 #[test]
@@ -332,7 +363,7 @@ fn serve_without_a_model() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("keys.txt"), "acme acme-0123456789abcdef\n").unwrap();
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
-    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_strata"))
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
         .args(["serve", "--addr", &addr, "--api-key", "root-0123456789abcdef", "--api-keys"]).arg(dir.join("keys.txt"))
         .arg("--models-dir").arg(&dir).stderr(std::process::Stdio::null()).spawn().unwrap();
     // The status line and body of one request.
@@ -371,4 +402,73 @@ fn serve_without_a_model() {
     }
     let _ = p.kill();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--parallel` outside 1..=255 is an invalid request: the server exits non-zero before it loads a model, naming the
+/// flag and the allowed range. No GPU, no model needed.
+#[test]
+fn serve_rejects_a_bad_parallel_count() {
+    for n in ["0", "256"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+            .args(["serve", "--addr", "127.0.0.1:0", "--parallel", n])
+            .output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "--parallel {n} exited 0: {err}");
+        assert!(err.contains(&format!("--parallel {n}: 1 to 255 slots")), "--parallel {n}: {err}");
+    }
+}
+
+/// `serve --parallel 2 --kv q8` answers two concurrent chat requests (end to end through the binary). Model- and
+/// GPU-gated: skipped unless `STRATA_MODEL` names a model and `STRATA_TEST_BACKENDS` asks for cuda (the GPU windows set
+/// both).
+#[test]
+fn serve_parallel_smoke() {
+    let Some(model) = std::env::var_os("STRATA_MODEL").filter(|p| std::path::Path::new(p).exists()) else {
+        eprintln!("SKIP: no STRATA_MODEL"); return
+    };
+    if !std::env::var("STRATA_TEST_BACKENDS").is_ok_and(|v| v.split(',').any(|b| b.trim().eq_ignore_ascii_case("cuda"))) {
+        eprintln!("SKIP: STRATA_TEST_BACKENDS does not select cuda");
+        return
+    }
+    use std::io::{Read, Write};
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--model"]).arg(&model)
+        .args(["--gpu", "--backend", "cuda", "--kv", "q8", "--ctx", "512", "--parallel", "2", "--addr", &addr])
+        .spawn().unwrap();
+    let result = (|| -> Result<Vec<String>, String> {
+        // The listener opens before the model is loaded: wait until `/health` answers 200.
+        let mut up = false;
+        for _ in 0..3000 {
+            if let Ok(mut c) = std::net::TcpStream::connect(&addr) {
+                let _ = write!(c, "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+                let mut s = String::new();
+                let _ = c.read_to_string(&mut s);
+                if s.starts_with("HTTP/1.1 200") { up = true; break; }
+            }
+            if p.try_wait().unwrap().is_some() { return Err("server exited before it loaded the model".into()) }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !up { return Err("server did not become healthy within 300 s".into()) }
+        let body = r#"{"messages":[{"role":"user","content":"Reply with one word."}],"max_tokens":4}"#;
+        let ask = |i: usize| -> String {
+            let mut c = std::net::TcpStream::connect(&addr).unwrap();
+            write!(c, "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let mut s = String::new();
+            c.read_to_string(&mut s).unwrap();
+            format!("request {i}: {s}")
+        };
+        Ok(std::thread::scope(|sc| (0..2).map(|i| sc.spawn(move || ask(i))).collect::<Vec<_>>()
+            .into_iter().map(|t| t.join().unwrap()).collect()))
+    })();
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill").args(["-TERM", &p.id().to_string()]).status();
+    let _ = p.kill();
+    let _ = p.wait();
+    let replies = result.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(replies.len(), 2);
+    for r in replies {
+        assert!(r.contains("200 OK"), "{r}");
+        assert!(r.contains("\"choices\""), "{r}");
+    }
 }

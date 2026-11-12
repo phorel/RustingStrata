@@ -1,4 +1,4 @@
-//! The small HTTP/1.1 subset `strata serve` speaks (std::net, one request per connection) and its chat request.
+//! The small HTTP/1.1 subset `rustingstrata serve` speaks (std::net, one request per connection) and its chat request.
 
 use crate::chat::{Json, Msg, tool_def};
 use anyhow::{Context, bail};
@@ -47,11 +47,15 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
     Ok(Request { method, path, host, auth, json, body })
 }
 
-/// Host header check against DNS rebinding: a loopback name, or the host the server was bound to.
-pub fn host_ok(host: &str, bound: &str) -> bool {
-    let name = |s: &str| s.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(s, |x| x.0).to_ascii_lowercase();
+/// Host header check against DNS rebinding: a loopback name, the host the server was bound to, or a name the user
+/// explicitly allowed (`--allowed-hosts` / `STRATA_ALLOWED_HOSTS`).
+pub fn host_ok(host: &str, bound: &str, allowed: &[String]) -> bool {
+    let name = |s: &str| {
+        let s = s.trim();
+        s.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(s, |x| x.0).trim_end_matches('.').to_ascii_lowercase()
+    };
     let n = name(host);
-    matches!(n.as_str(), "localhost" | "127.0.0.1" | "[::1]") || n == name(bound)
+    !n.is_empty() && (matches!(n.as_str(), "localhost" | "127.0.0.1" | "[::1]") || n == name(bound) || allowed.iter().any(|a| name(a) == n))
 }
 
 /// Whether the client closed the connection (it sends nothing more after its request).
@@ -263,10 +267,14 @@ pub struct Stats {
     pub backend: String,
     pub device: String,
     pub ctx: usize,
+    #[serde(skip)]
+    pub ctx_train: Option<u64>,
     /// Requests decoded at once (`--parallel`).
     pub slots: usize,
     /// Device memory in use and in total, measured after the load and after each request.
     pub vram: Option<(u64, u64)>,
+    /// Host RAM cap in bytes (`total - --ram-margin`, or `--max-ram`); `None` if undetectable.
+    pub ram_cap: Option<u64>,
     /// MoE expert cache hits and misses, and MTP drafts tried and accepted, since the model loaded.
     pub experts: Option<(u64, u64)>,
     pub drafts: Option<(u64, u64)>,
@@ -327,6 +335,9 @@ impl Stats {
         if let Some((u, t)) = self.vram {
             m("vram_used_bytes", "gauge", "Device memory in use.", u);
             m("vram_total_bytes", "gauge", "Device memory in total.", t);
+        }
+        if let Some(c) = self.ram_cap {
+            m("ram_cap_bytes", "gauge", "Host RAM cap (total minus margin, or --max-ram).", c);
         }
         if let Some((h, x)) = self.experts {
             m("expert_hits_total", "counter", "Routed experts found on the GPU since the model loaded.", h);

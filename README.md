@@ -1,28 +1,27 @@
 # RustingStrata
 
-A pure-Rust inference engine for the Qwen3.5/3.6 hybrid model family (`qwen35moe`, `qwen35`) in GGUF; Qwen3-Next
-(`qwen3next`), Qwen3.8-Flash-Next (`qwen4exp`) and Qwen3 (`qwen3`, `qwen3moe`) also run. CUDA kernels are compiled at run time with NVRTC through
-cudarc (cached as a cubin), and the same kernels also run on Vulkan (`--backend vulkan`, GLSL compiled to SPIR-V and
-committed): no C++ build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU
-work, and the expert placement adapts to the routing it sees.
+A pure-Rust inference engine for Qwen GGUF models: Qwen3.5/3.6 (`qwen35moe`, `qwen35`), Qwen3-Next (`qwen3next`),
+Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`) and GLM-5.3-Flash (`glm5-next`). CUDA kernels are
+compiled at run time with NVRTC through cudarc, and the same kernels also run on Vulkan (`--backend vulkan`): no C++
+build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU work, and the expert
+placement adapts to the routing it sees.
 
-Status: v1.2.0. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
-`docs/m6-results.md`.
+Version 1.2.1. Docs: [usage and server API](docs/USAGE.md), [hosting for other people](docs/HOSTING.md),
+[supported GPUs](docs/SUPPORTED_GPUS.md), [AMD notes](docs/AMD.md), [LoRA](docs/LORA.md),
+[all benchmarks](docs/BENCHMARKS.md), [benchmark history](docs/README.md).
 
 ## This fork
 
 Forked from [RustingStudio/RustingStrata](https://github.com/RustingStudio/RustingStrata) at commit `95964da`
-(2026-11-07) to run on an RTX 2060 SUPER 8 GB with a Ryzen 5 3600 and 32 GB of RAM. Upstream has moved on since (813
-commits by 2026-11-11) and none of that is merged here. The numbers below are from that machine; the tables in
+(2026-11-07) to run on an RTX 2060 SUPER 8 GB with a Ryzen 5 3600 and 32 GB of RAM. Upstream was merged in again on
+2026-11-12 (`v1.2.1` and later); where upstream had made the same change, its version was kept. The numbers below are from that machine; the tables in
 [Numbers](#numbers) are upstream's, from its RTX 3060 reference machine.
 
 | Change | What it does | Measured here |
 |---|---|---|
-| CUDA on Turing (sm_75) | The kernels compile and run on RTX 20 cards: warp reductions by shuffles, tensor-core multiplies in Turing's shapes, a synchronous fallback for `cp.async`, shared memory within 64 KB. | |
 | `serve`: `developer` role | The OpenAI `developer` role is taken as `system`. | |
 | `serve`: `GET /props` | The llama-server fields that clients read. | |
 | `serve`: `--default-think` | Thinking on when a request does not say; a request that sets `enable_thinking` still wins. | |
-| Integer Q5_K CPU kernel | Q5_K experts on the CPU no longer go through the f32 fallback (the down experts of Q4_K_M files). | 35B-A3B Q4_K_M: 29 to 57 tok/s decode. |
 | `--ngram [N]` | Drafts from repeated text: when the last N tokens occurred earlier in the context, the 3 tokens that followed are verified in one forward. Output is unchanged. | 35B-A3B Q4_K_S, file rewrite: 48-52 to 72-74 tok/s; text with no repeats: 49-51 to 44-47. |
 | Integer IQ4_NL CPU kernel | The same for IQ4_NL experts (the down experts of half the layers of Qwen3.8-Flash-Next UD-IQ2_XS, every expert of IQ4_NL files). | Flash-Next UD-IQ2_XS: 7.5-7.9 to 9.8-11.3 tok/s decode. |
 | Gyro files | The trellis types TQ2_T, TQK4-TQK7 and TQP5-TQP7 and the Hadamard rotation of agentionai's Gyro quants of Qwen3.8-Flash-Next: CPU reference, integer CPU kernels, CUDA decode and batched prefill. On Vulkan, and for TQP (Gyro-L), the experts run on the CPU and the prompt goes token by token. `--ple <table.gguf>` gives a `-noPLE` file its n-gram table from another GGUF. | Gyro-S: 11-15 tok/s decode, 208-222 tok/s on a 1737-token prompt. |
@@ -53,7 +52,7 @@ does not fit in VRAM). llama.cpp is the 2026-10-28 build 11876, tuned for the sa
 | 32K: prefill / decode | **1800 / 91.9 tok/s** | 1582 / 90.7 | |
 | Greedy top-1 agreement with llama.cpp (20 prompts x 32 tokens), either llama.cpp mode | 98-99% | 98-99% | 98.3% (its batch vs token-by-token modes) |
 
-Measured with `strata bench --gpu --mtp 0 --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, mean of 3 rounds
+Measured with `rustingstrata bench --gpu --mtp 0 --pp 512,4096,32768 --tg 128 --reps 3 --ctx 32896`, mean of 3 rounds
 (range in brackets); llama.cpp from `llama-server` timings, 4047-token prompt + 128 tokens, 3 runs.
 MTP gains depend on the text.
 Agreement counts a token when it matches llama.cpp run token by token or with the context as one batch;
@@ -90,102 +89,107 @@ the table does not record which, so that cannot be checked.
 
 ## Build
 
-Needs Rust (2024 edition) and either an NVIDIA driver with the CUDA 13 NVRTC library (loaded at run time) or a
-Vulkan 1.3 driver with shaderFloat64, int8/16/64 and subgroup size 32 (tested only on an RTX 3060; Intel Arc lacks
-shaderFloat64, pre-RDNA AMD lacks subgroup size 32). `--gpu` picks CUDA when it loads, else Vulkan; `--backend`
-chooses. The first CUDA run compiles the kernels (~15 s) and caches them. AMD GPUs: see [docs/AMD.md](docs/AMD.md)
-for known issues and what to send in a report.
+Needs Rust (2024 edition) and one of:
+
+- an NVIDIA driver with the CUDA NVRTC library (loaded at run time). Volta (sm_70), Turing (sm_75) and Ampere or newer
+  (sm_80+) work; CUDA 13 dropped Volta, so a V100 needs the 12.x toolkit. Pascal and older use Vulkan.
+- a Vulkan 1.3 driver with shaderFloat64, int8/16/64 and subgroup size 32 or a fixed 64 (tested on RTX 3060, Radeon VII
+  and V100; Intel Arc lacks shaderFloat64).
+
+`--gpu` picks CUDA when it loads, else Vulkan; `--backend` chooses. The first CUDA run compiles the kernels (~15 s) and
+caches them. Every GPU tried so far is in [docs/SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md); AMD notes are in
+[docs/AMD.md](docs/AMD.md).
 
 ```sh
 cargo build --release
 ```
 
-Windows: install the Visual Studio C++ Build Tools first (one dependency compiles C code).
+On Windows, install the Visual Studio C++ Build Tools first (one dependency compiles C code).
 
-## Use
+## Quick start
 
-Without a terminal: run `strata` (double-click `strata.exe` on Windows; release binaries are on the GitHub releases
-page). It starts the server on http://127.0.0.1:8080 and opens a chat page in the browser. The page keeps chats in
-the browser, downloads models from Hugging Face (Models and settings; `HF_TOKEN` for gated repos), switches between
-the models in the models folder (`%LOCALAPPDATA%\rusting_strata\models` on Windows,
-`~/.local/share/rusting_strata/models` elsewhere, or `serve --models-dir`), and shows the context use, speed, totals and CPU, memory and graphics memory use
-of the server. Other apps that take an OpenAI-compatible address (Open WebUI, Jan, SillyTavern, code editors) can
-use `http://127.0.0.1:8080/v1` too.
+Run `rustingstrata` with no arguments (double-click `rustingstrata.exe` on Windows; release binaries are on the GitHub releases page).
+It starts a server on http://127.0.0.1:8080 and opens a chat page that downloads models from Hugging Face and switches
+between the ones in your models folder. Any app that takes an OpenAI-compatible address (Open WebUI, Jan, SillyTavern,
+code editors) can use `http://127.0.0.1:8080/v1`.
 
 From a terminal:
 
 ```sh
 M=path/to/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
 
-# Measure the best prefill chunk, short-prompt threshold and MTP drafts on this machine once.
-# Later runs read ~/.cache/rusting_strata/strata-<model>.json unless flags override it.
-target/release/strata calibrate --model $M
-
-target/release/strata generate --model $M --gpu --prompt "Write a haiku about rivers." -n 128
-target/release/strata chat --model $M --gpu                 # --think for thinking mode, --temp 0.7 to sample
-target/release/strata bench --model $M --gpu --pp 512,4096 --tg 128
-STRATA_API_KEY=secret target/release/strata serve --model $M --gpu --addr 127.0.0.1:8080
+target/release/rustingstrata calibrate --model $M     # once per model and machine: best chunk size, MTP drafts
+target/release/rustingstrata generate --model $M --gpu --prompt "Write a haiku about rivers." -n 128
+target/release/rustingstrata chat --model $M --gpu    # --think for thinking mode, --temp 0.7 to sample
+target/release/rustingstrata bench --model $M --gpu --pp 512,4096 --tg 128
+STRATA_API_KEY=secret target/release/rustingstrata serve --model $M --gpu --addr 127.0.0.1:8080
 ```
 
-`serve` speaks the OpenAI chat completions API (`POST /v1/chat/completions`, streamed or not, `GET /v1/models`).
-It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
-3060, 41 each; see [docs/HOSTING.md](docs/HOSTING.md)). `temperature`, `top_k`, `top_p` and `seed` are honored, and decoding is greedy when
-they are left out. `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI
-API; `n` must be 1. Thinking is off unless a request sets `chat_template_kwargs.enable_thinking` (Anthropic:
-`thinking: {"type": "enabled"}`). When a request repeats the previous request's messages and adds new ones, only the new part is
-prefilled (`usage.prompt_tokens_details.cached_tokens`). `tools` and `tool_choice` work as in the OpenAI API (calls
-come back as `tool_calls` with `finish_reason: "tool_calls"`). The prompt follows the model's own chat template,
-rendered like llama.cpp's `--jinja`. `tool_choice: "required"` does not force a call.
-`POST /v1/messages` speaks the Anthropic Messages API (text, `tool_use` and `tool_result` blocks, streamed or not,
-the key in `x-api-key`, and `POST /v1/messages/count_tokens`), so Claude Code can use the server:
-`ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=secret ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=local claude`.
-OpenCode and other agents use the OpenAI address. Qwen3.6's template leaves the think block out of replies before the
-last user message, so each new user message changes the text of the earlier turns and the whole conversation is
-prefilled again. Strata keeps those blocks by default, so a long agent session prefills only what was added;
-`--preserve-thinking false` (or `chat_template_kwargs.preserve_thinking` in a request) follows the template.
-A request with another history (an agent's side request for a title or a summary) parks the conversation's state in
-host memory (`--cache-ram`, 4096 MB by default), and the next request that continues it takes it back instead of
-prefilling it again.
-For a server that other people use (customer keys in a file, a usage log for billing, `/health`, TLS through a
-reverse proxy, systemd), see [docs/HOSTING.md](docs/HOSTING.md). Each customer key reuses only its own cached
-conversations; all requests under one key count as one user.
+Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking. Flags, the OpenAI and
+Anthropic APIs, tool calls, caching and multi-GPU are in [docs/USAGE.md](docs/USAGE.md).
 
-Useful flags: `--ctx` (KV cache size, default 4096), `--mtp [N]` (speculative decoding with the model's draft
-head; greedy tokens stay the same, sampling keeps its distribution), `--ngram [N]` (drafts from repeated text: when the last N
-tokens, 8 by default, occurred earlier in the context, the 3 tokens that followed are verified in one forward; same
-output guarantees, about 190 MB of VRAM for rollback states, pays when the reply repeats the context), `--chunk`, `--threads`, `--vram-margin`. On a
-GPU that drives no display, `--vram-margin 256` keeps more experts resident (+1-2% prefill); 128 runs out of
-memory. `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower
-32K prefill. Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking.
+## DeepSeek-V4.1-Flash (IQ2_XXS, 249 GB)
 
-Several GPUs: `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay
-resident. The cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP
-drafting is off on a split model. AMD cards clock down in the gaps while the other card works; `echo high >
-/sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
-tok/s in one report.
+`chat`, `generate` and `serve` detect the `deepseek41` architecture and run it on the CPU reference forward, with the
+matvecs and a 9 GB expert cache on the CUDA card (no `--gpu` flag needed). Pass the first shard; the others are found
+next to it.
 
-The experts that do not fit in VRAM are read from the GGUF through the page cache. A file system that keeps file data
-out of the page cache (ZFS with `primarycache=metadata`) makes every run read them from disk again; load the model
-from a file system that caches data, or from a tmpfs copy.
+```sh
+M=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf
+rustingstrata chat     --model $M [--think]
+rustingstrata generate --model $M --prompt "The capital of France is" -n 64
+rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
+```
 
-## Tests
+| DeepSeek-V4.1-Flash IQ2_XXS (249 GB), RTX 3060 12 GB, 30 GB RAM | RustingStrata | llama.cpp b12116 (`--cpu-moe`) |
+|---|---|---|
+| Decode | 1.8 tok/s at first, 2-3.6 tok/s now (VRAM expert cache with LRU) | 0.3-1.5 tok/s (cold) |
+| Prefill | ~2 tok/s on short prompts (0.5 s/token), ~0.5 tok/s at 1400 tokens | 0.5-0.9 tok/s (cold) |
+| Teacher-forced top-1 vs llama.cpp | 189/192 short, 21/23 on 1425 tokens (misses are near-ties) | - |
+| Sampling, tool calls | no sampling; tool calls in `serve` | supported |
+
+The llama.cpp numbers are from the first cold runs on this box and the RustingStrata numbers from the last runs
+before the model was deleted; they were not re-measured side by side, and both move with the page cache.
+Decode varies run to run with the page cache, because the experts that miss VRAM are read from the GGUF.
+`STRATA_DS_GPU_EXPERTS=<GB>` changes the VRAM expert budget (10 worked on a 12 GB card). Prefill is one token at a
+time. Prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_DS_CTX` lowers it; checked against llama.cpp only up to a 1425-token prompt), decoding is greedy only, and sampling is not supported. Tool calls work in `serve`: the prompt matches the model template (jinja2 render, three cases byte for byte) and the reply's `<｜DSML｜ calls>` block is parsed, but this path has not been run against the model itself.
+
+## GLM-5.3-Flash (UD-Q2_K_XL, 119 GB)
+
+`chat`, `generate` and `serve` detect the `glm5-next` architecture (Kimi-delta attention, sparse MLA attention, four-stream
+hyper-connections, sigmoid MoE) and run the CPU reference forward, with the dense matvecs and an 11 GB expert cache on the
+CUDA card (`STRATA_DS_GPU_EXPERTS=<GB>` changes the budget; it also counts the non-expert weights). Pass the first shard.
+
+```sh
+M=GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf
+rustingstrata chat     --model $M
+rustingstrata generate --model $M --prompt "The capital of France is" -n 64
+rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
+```
+
+Greedy output equals llama.cpp b12119 (`--cpu-moe`) for 32 tokens on 3 fixed prompts on the CPU path; with the GPU matvecs
+prompts 1 and 2 still match for 32 tokens and prompt 3 flips at the first token, a near-tie (logprob -2.65 against -2.73). Fed llama.cpp's own 64 tokens per prompt (teacher-forced), the GPU path picks the same top-1 on 188 of 192 steps; the four misses are llama.cpp near-ties (margins 0.03-0.53 logprob). Tokenizer ids
+match llama.cpp on 29 test strings and the chat template matches `/apply-template` on 2 conversations.
+On an RTX 3060 12 GB with 30 GB RAM decode took about 0.4-0.7 s per token with warm page cache (about 55% VRAM expert-cache
+hits on a short text); llama.cpp (`--cpu-moe`, server, 64 greedy tokens per prompt) took 2.3-2.9 s per token (0.34-0.44 tok/s) on the same box in the same session, started right before our runs on the same page cache; a later paired run (64 greedy tokens through `serve`, llama.cpp, ours, ours, llama.cpp) gave 1.25-1.40 tok/s against 0.47-0.56, a first token after 17-19 s against 40-41 s on a short prompt, load until ready in 4-6 s against 58 s, and, on a 550-token prompt, a first token after 206-209 s against 107-229 s (llama.cpp's second run had the page cache warm); both timings move with the page cache and the pairs were run twice, not as a full benchmark.
+Caveats: prefill runs 512-token chunks layer by layer so each routed expert is read once per chunk (a 380-word, about 550-token prompt prefilled in 209 s with 512-token chunks against 325 s with 128, identical logprobs; short prompts cost more per token because the experts stream from SSD once per chunk, `STRATA_GLM_CHUNK` sets the size); prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_GLM_CTX` lowers it, and the KV cache grows with the text, so RAM is the real bound; the k-pool sparse-attention indexer takes over past 2048 rows and was checked against llama.cpp up to 3.6k tokens: same top-5 sets, same first token); the NextN/MTP layer is unused; decoding is greedy only; tool calls work in `serve` (the prompt matches llama.cpp's template byte for byte, checked on one tool call and one tool-result round trip); the reasoning
+text comes back in `content` before `</think>`.
+
+## Development
 
 ```sh
 cargo test --release                      # GPU tests need the model: STRATA_MODEL=path/to/model.gguf
 python -I tools/parity.py $M --extra "--gpu" --tag gpu   # agreement with llama.cpp (needs llama-server once)
 ```
 
-## Layout
-
-`src/gguf.rs` (file reader), `src/quant/` (dequantization), `src/model.rs` (CPU reference forward),
-`src/cuda/` and `src/vulkan/` (GPU kernels and shaders, behind `src/backend.rs`), `src/gpu_model.rs` (GPU forward,
-MTP, verify), `src/gpu_model/prefill.rs` (chunked prefill), `src/expert_cache.rs` (expert placement), `src/cpu_moe.rs`
-and `src/cpu_worker.rs` (CPU expert compute), `src/serve.rs` (HTTP), `src/chat.rs` (chat templates and tool calls),
-`src/main.rs` (CLI).
+Source map: `src/gguf.rs` (file reader), `src/quant/` (dequantization), `src/model.rs` (CPU reference forward),
+`src/cuda/` and `src/vulkan/` (GPU kernels, behind `src/backend.rs`), `src/gpu_model.rs` and
+`src/gpu_model/prefill.rs` (GPU forward and chunked prefill), `src/expert_cache.rs` (expert placement),
+`src/cpu_moe.rs` and `src/cpu_worker.rs` (CPU experts), `src/deepseek/` (DeepSeek-V4.1), `src/glm/` (GLM-5.3), `src/serve.rs` (HTTP),
+`src/chat.rs` (chat templates and tool calls), `src/main.rs` (CLI).
 
 ## License
 
-RustingStrata is released under the [RustingStrata License 1.0](LICENSE.md).
-You may use, modify and distribute it, including for commercial services, as
-long as you keep the license and credit Vasyl Trefilov as the original author.
+RustingStrata is released under the [RustingStrata License 1.0](LICENSE.md). You may use, modify and distribute it,
+including for commercial services, as long as you keep the license and credit Vasyl Trefilov as the original author.
 You may not sell RustingStrata itself.

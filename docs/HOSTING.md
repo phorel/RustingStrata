@@ -1,16 +1,16 @@
-# Hosting Strata for other people
+# Hosting RustingStrata for other people
 
-This page is for running `strata serve` as a service that other people or programs use over the network, for
+This page is for running `rustingstrata serve` as a service that other people or programs use over the network, for
 example to sell API access to a model. It covers keys, TLS through a reverse proxy, a systemd unit, health checks,
 the usage log for billing, and how many requests one server answers at once.
 
-The [license](../LICENSE.md) allows commercial services built on Strata: you can charge for access to a model that
-Strata serves. Keep the license and the credit to the original author. You may not sell Strata itself. The model has
+The [license](../LICENSE.md) allows commercial services built on RustingStrata: you can charge for access to a model that
+RustingStrata serves. Keep the license and the credit to the original author. You may not sell RustingStrata itself. The model has
 its own license (most Qwen models are Apache 2.0; check the model card).
 
 ## How much one server does
 
-By default `strata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default)
+By default `rustingstrata serve` answers one chat request at a time. Others wait in a queue (`--max-waiting`, 16 by default)
 and run in arrival order. `--max-waiting` counts every open connection (being read, generated or queued, health
 checks included), so with one reply running 15 places are left for the queue. Beyond it a connection gets
 `503 Service Unavailable` with `Retry-After: 2` (`--max-per-key` keeps one customer from taking all the places). One
@@ -63,7 +63,7 @@ What changes with `--parallel N`:
   another customer's one. Without `--api-keys` the queue is first come, first served.
 - **More than 4 slots** do not raise the total, because one pass decodes at most 4 requests. They let more users
   stream at the same time instead of waiting in the queue, each at a lower speed.
-- **Prefill.** Prompts are prefilled one at a time, in chunks (`--chunk`, from `strata calibrate`). After each
+- **Prefill.** Prompts are prefilled one at a time, in chunks (`--chunk`, from `rustingstrata calibrate`). After each
   chunk the requests that are decoding run for as long as the chunk took, so a long prompt and the streams share
   the GPU evenly: the prompt takes about twice as long to its first token, and each stream pauses for one chunk at a
   time. A smaller `--chunk` gives shorter pauses but a slower prefill. A 10K-token prompt that arrives while 3
@@ -98,14 +98,14 @@ On a Linux machine with an NVIDIA driver (or a Vulkan 1.3 driver):
 ```sh
 # 1. The binary: a release binary, or build it on this machine (.cargo/config.toml builds for the local CPU).
 cargo build --release
-sudo install -m 755 target/release/strata /usr/local/bin/strata
+sudo install -m 755 target/release/rustingstrata /usr/local/bin/rustingstrata
 
 # 2. A service user, a model, and the calibration for this machine (once per model and machine). It runs as the
 #    service user, with the --ctx and --kv of the server, because it is kept in that user's ~/.cache/rusting_strata.
 sudo useradd --system --create-home --home-dir /var/lib/strata strata
 sudo usermod -aG video,render strata      # GPU device access on most distributions
 M=/srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
-sudo -u strata strata calibrate --model $M --ctx 32768 --kv q8
+sudo -u strata rustingstrata calibrate --model $M --ctx 32768 --kv q8
 
 # 3. Keys: one admin key, and a file of customer keys.
 openssl rand -hex 24                            # run once per key
@@ -119,13 +119,13 @@ sudo chown strata /etc/strata/keys.txt && sudo chmod 600 /etc/strata/keys.txt
 
 # 4. Run it on the loopback address; the reverse proxy below is the only thing that faces the network.
 #    (systemd below runs the same command as a service.)
-sudo -u strata env STRATA_API_KEY=<admin key> strata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
+sudo -u strata env STRATA_API_KEY=<admin key> rustingstrata serve --model $M --gpu --ctx 32768 --addr 127.0.0.1:8080 \
     --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 --parallel 4 --kv q8 \
     --max-per-key 4
 ```
 
 Clients then use the OpenAI address `https://api.example.com/v1` with their key, or the Anthropic address
-`https://api.example.com` (`POST /v1/messages`). The request fields Strata honors (sampling, `stop`, tools,
+`https://api.example.com` (`POST /v1/messages`). The request fields RustingStrata honors (sampling, `stop`, tools,
 thinking) are listed under [Use](../README.md#use) in the README; the usage of a streamed reply comes in its last
 chunk.
 
@@ -155,23 +155,28 @@ chunk.
 - With customer keys and no admin key, nobody can use the admin routes.
 - With no key at all the server is open to anyone who reaches it. That is meant for a local machine only.
 
+When the server is reached through a LAN name while bound to `0.0.0.0` (for example `http://ai-server.lan:8080`),
+add that name to the Host check: `--allowed-hosts ai-server.lan,ai-server.local` or
+`STRATA_ALLOWED_HOSTS=ai-server.lan,ai-server.local`. Names match exactly and ignore case and the port; loopback
+names and the bound address stay allowed. Without keys this check still stops DNS rebinding.
+
 Clients send the key as `Authorization: Bearer <key>` (OpenAI; `Bearer` as written) or `x-api-key: <key>`
 (Anthropic).
 
-**Privacy between keys.** Strata keeps recent conversation states in GPU and host memory (`--cache-ram`) so that a
+**Privacy between keys.** RustingStrata keeps recent conversation states in GPU and host memory (`--cache-ram`) so that a
 request that continues a conversation prefills only the new part. Each key only reuses states that its own requests
 made, so one customer cannot tell from `cached_tokens` or from the response time what another customer sent. All
 requests under one key count as one user: if a customer serves many end users through one key, the customer's end
-users can learn this about each other. Strata does not write prompts or replies to disk; the usage log holds only
+users can learn this about each other. RustingStrata does not write prompts or replies to disk; the usage log holds only
 counts and times.
 
 ## Reverse proxy and TLS
 
-Strata speaks plain HTTP. Put a reverse proxy in front of it for TLS, and bind Strata to `127.0.0.1`. When keys are
-set, Strata accepts any `Host` header, so the proxy can pass the public name through.
+RustingStrata speaks plain HTTP. Put a reverse proxy in front of it for TLS, and bind RustingStrata to `127.0.0.1`. When keys are
+set, RustingStrata accepts any `Host` header, so the proxy can pass the public name through.
 
 Streaming replies (`"stream": true`) must reach the client as they are written, so turn off response buffering, and
-give the proxy a read timeout that is longer than your longest reply. Strata sends nothing, not even the headers of a
+give the proxy a read timeout that is longer than your longest reply. RustingStrata sends nothing, not even the headers of a
 stream, until the prompt is prefilled, so the timeout must also cover the wait in the queue plus the prefill of your
 longest prompt. A proxy whose timeout you cannot raise (Cloudflare gives up after 100 s without a response) needs a
 `--ctx` small enough that the longest prompt prefills in time, or a direct route that bypasses it.
@@ -198,7 +203,7 @@ server {
     ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
 
-    client_max_body_size 8m;        # Strata refuses bodies over 8 MiB
+    client_max_body_size 8m;        # RustingStrata refuses bodies over 8 MiB
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
@@ -220,14 +225,14 @@ To keep the chat page and the admin routes off the public address, serve only `/
 Then reach the chat page through an SSH tunnel: `ssh -L 8080:127.0.0.1:8080 server`, and open
 http://127.0.0.1:8080 with the admin key.
 
-Strata caps the requests each key has open itself (`--max-per-key`, see [Limits per request](#limits-per-request)).
+RustingStrata caps the requests each key has open itself (`--max-per-key`, see [Limits per request](#limits-per-request)).
 A cap on requests per minute belongs in the proxy:
 
 ```nginx
 # in http { }
 limit_req_zone  $http_authorization zone=perkey_rate:10m rate=60r/m;
 
-# in the location that passes /v1/ to Strata
+# in the location that passes /v1/ to RustingStrata
 limit_req  zone=perkey_rate burst=20 nodelay;
 limit_req_status  429;
 ```
@@ -246,14 +251,14 @@ STRATA_API_KEY=<admin key>
 
 ```ini
 [Unit]
-Description=Strata inference server
+Description=RustingStrata inference server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=strata
 EnvironmentFile=/etc/strata/env
-ExecStart=/usr/local/bin/strata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --ctx 32768 \
+ExecStart=/usr/local/bin/rustingstrata serve --model /srv/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf --gpu --ctx 32768 \
     --addr 127.0.0.1:8080 --api-keys /etc/strata/keys.txt --usage-log /var/lib/strata/usage.jsonl --max-tokens 4096 \
     --parallel 4 --kv q8 --max-per-key 4
 StateDirectory=strata
@@ -341,7 +346,7 @@ jq -r 'select(.finish != "error") | [(.at | strftime("%Y-%m-%d")), .key, .prompt
   | awk '{k=$1" "$2; p[k]+=$3; c[k]+=$4; o[k]+=$5} END {for (k in p) print k, p[k], c[k], o[k]}' | sort
 ```
 
-The file only grows; rotate it with logrotate (`copytruncate`, since Strata keeps it open).
+The file only grows; rotate it with logrotate (`copytruncate`, since RustingStrata keeps it open).
 
 ## Limits per request
 
@@ -351,7 +356,7 @@ The file only grows; rotate it with logrotate (`copytruncate`, since Strata keep
   request may decode until the context is full, which holds the server for minutes.
 - Bodies over 8 MiB are refused, a connection that sends nothing for 30 s is closed, and a body needs a
   `Content-Length` (a chunked upload gets `400`). nginx buffers the request by default, which covers both: a slow
-  client then holds nginx, not a Strata place.
+  client then holds nginx, not a RustingStrata place.
 - A missing or wrong key (`401`), a malformed request (`400`), `GET /v1/models` and the chat page are answered as
   soon as they are read, without a place in the queue, so a scan for keys does not delay paying customers.
 - A client that disconnects stops its reply within a few tokens, so the next request in the queue starts. One that
@@ -368,8 +373,8 @@ The file only grows; rotate it with logrotate (`copytruncate`, since Strata keep
 **One server per GPU, more users.** Start one server per card on its own port and balance between them:
 
 ```sh
-strata serve --model $M --gpu --device 0 --addr 127.0.0.1:8081 --threads 6 ...
-strata serve --model $M --gpu --device 1 --addr 127.0.0.1:8082 --threads 6 ...
+rustingstrata serve --model $M --gpu --device 0 --addr 127.0.0.1:8081 --threads 6 ...
+rustingstrata serve --model $M --gpu --device 1 --addr 127.0.0.1:8082 --threads 6 ...
 ```
 
 ```nginx
@@ -392,7 +397,7 @@ keeps its last conversation. For many users on cards that each fit the model, on
 
 ## Checklist
 
-- [ ] Strata listens on `127.0.0.1` only; the firewall opens 443 (and 80 for the certificate), not 8080.
+- [ ] RustingStrata listens on `127.0.0.1` only; the firewall opens 443 (and 80 for the certificate), not 8080.
 - [ ] An admin key, and customer keys in a file with mode 600.
 - [ ] The proxy streams without buffering and has a long read timeout.
 - [ ] `--max-tokens` and `--ctx` fit your price list and your GPU memory (times `--parallel`).
@@ -400,4 +405,4 @@ keeps its last conversation. For many users on cards that each fit the model, on
 - [ ] `--max-per-key` below `--max-waiting`, so one customer cannot fill the queue.
 - [ ] `--usage-log` is on and rotated.
 - [ ] `/health` (or `/metrics`) is monitored, and systemd restarts the server on failure.
-- [ ] `strata calibrate` ran on this machine as the service user.
+- [ ] `rustingstrata calibrate` ran on this machine as the service user.

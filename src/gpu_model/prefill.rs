@@ -85,17 +85,17 @@ impl GpuModel<'_> {
         let Some(chunk) = self.pf.as_ref().map(|p| p.chunk) else { return self.step_all(tokens) };
         if tokens.len() < self.short { return self.step_all(tokens); }
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
+        // STRATA_PF_ADAPT=N: place the hot experts after every N-th chunk of a long prompt, not only after all of it,
+        // so the later chunks run with the placement the first ones showed (0 = off, the default; untested on real hardware).
+        let every = std::env::var("STRATA_PF_ADAPT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let nchunks = tokens.len().div_ceil(chunk);
         for (i, ch) in tokens.chunks(chunk).enumerate() {
             if i > 0 { between(self)?; }
             self.prefill_chunk(ch, None)?;
+            if every > 0 && (i + 1) % every == 0 && i + 1 < nchunks { self.adapt_experts()?; }
         }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
-        let adapt = self.adapt_every > 0;
-        let mut p = Some(&mut *self);
-        while let Some(q) = p {
-            if adapt && let Some(cache) = q.cache.as_mut() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
-            p = q.next.as_deref_mut();
-        }
+        self.adapt_experts()?;
         let s = self.tail();
         let (g, ne) = (&s.gpu, s.m.cfg.n_embd);
         let h = s.bufs["h"].addr();
@@ -107,6 +107,20 @@ impl GpuModel<'_> {
         }
         g.gemv(s.output.as_ref().unwrap(), h, s.logits.addr())?;
         g.get::<f32>(&s.logits, 0, s.m.cfg.n_vocab)
+    }
+
+    /// Move the hot missed experts into VRAM (all parts of a split model). A fully resident cache has no hot missed
+    /// expert to place: skip the scan over all its entries (issue #34 R2).
+    fn adapt_experts(&mut self) -> anyhow::Result<()> {
+        let adapt = self.adapt_every > 0;
+        let mut p = Some(&mut *self);
+        while let Some(q) = p {
+            if let Some(cache) = q.cache.as_mut() {
+                if adapt && !cache.fully_resident() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+            }
+            p = q.next.as_deref_mut();
+        }
+        Ok(())
     }
 
     /// A fresh sequence: `prefill(tokens)` from position 0, reusing earlier work. The state after `tokens[..keep]` is
@@ -214,9 +228,9 @@ impl GpuModel<'_> {
         // The draft head runs as one more layer on the chunk while it is in step with the main model.
         let fill = self.mtp_synced();
         let mtp = self.mtp.as_ref().filter(|_| fill);
-        // STRATA_NAN_TRACE: one line per layer with the largest magnitude of each intermediate buffer, and the first
+        // STRATA_NAN_TRACE[=N]: from position N (default 0), one line per layer with the largest magnitude of each intermediate buffer, and the first
         // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
-        let trace = std::env::var_os("STRATA_NAN_TRACE").is_some();
+        let trace = std::env::var("STRATA_NAN_TRACE").is_ok_and(|v| self.pos >= v.parse::<usize>().unwrap_or(0));
         let mut tr = String::new();
         let probe = |tr: &mut String, what: &str, b: &Buf, o: u64, w: usize, rows: usize| -> anyhow::Result<()> {
             if !trace { return Ok(()); }
@@ -253,6 +267,9 @@ impl GpuModel<'_> {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, .. } => {
                     let (eb, eg) = (at(l.e), at(l.e + n * nv));
                     g.gemm_dense(qkv, t, h, ne, at(l.a), channels, 0)?;
+                    // The qkv GEMM above already quantized `h`; when it did not (IQ2_XS, or a shape the int8 GEMM
+                    // skips), prepare it now so beta, alpha and the gate can all reuse one copy.
+                    g.prequant_gemm_x(gate, t, h, ne)?;
                     g.conv_seq(at(l.a), conv[self.cur].addr(), conv_w.ptr, at(l.c), channels, c.ssm_conv, t, 0, 0)?;
                     // The beta and alpha GEMMs (16 blocks each) run beside the norm: batch launches alternate streams.
                     g.batch(&mut || {
@@ -353,6 +370,12 @@ impl GpuModel<'_> {
                     probe(&mut tr, "router", &pf.slab, at(l.rl), c.n_expert, t)?;
                     probe(&mut tr, "weights", &pf.slab, at(l.wts), k, t)?;
                     let ids = g.get::<i32>(&pf.ints, 0, t * k)?;
+                    // Ids outside 0..n_expert mean the router ran on corrupt logits (issue #25: one prefill past ~128k
+                    // tokens). Fail here with the place, not in the index math below. ponytail: the root cause is still open.
+                    if let Some(&bad) = ids.iter().find(|&&e| e < 0 || e as usize >= c.n_expert) {
+                        anyhow::bail!("prefill: router gave expert id {bad} at layer {il}, chunk of {t} tokens from position {}; \
+                            the hidden state is non-finite (try STRATA_NAN_TRACE=1), or lower --chunk / --ctx", self.pos);
+                    }
                     let cache = self.cache.as_mut().unwrap();
                     cache.record(il, &ids);
                     // Sort (token, j) pairs by expert: slot s holds token xrow[s]; inv maps t * k + j to its slot.

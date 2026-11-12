@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
+use rusting_strata::memory;
 use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
@@ -9,7 +10,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::{collections::BTreeMap, net::{TcpListener, TcpStream}, sync::atomic::Ordering::Relaxed, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
 
 #[derive(Parser)]
-#[command(name = "strata", version, about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
+#[command(name = "rustingstrata", version, about = "Rust inference engine for Qwen3.5/3.6-family GGUF models")]
 struct Cli {
     /// Without a command, strata serves the chat page on 127.0.0.1:8080 on the GPU (else the CPU) and opens it in
     /// the browser.
@@ -66,10 +67,20 @@ struct Engine {
     /// repeat exactly.
     #[arg(long)]
     fixed_experts: bool,
+    /// Host RAM left free for the OS, in MB. The cap is `total RAM - margin` and bounds memory the process owns
+    /// (baked tensors, LoRA factors, `--cache-ram`); the mmapped model is evictable page cache and is not counted.
+    #[arg(long, default_value_t = 512)]
+    ram_margin: usize,
+    /// Absolute host RAM cap in MB; overrides `--ram-margin`. 0 uses the margin.
+    #[arg(long, default_value_t = 0)]
+    max_ram: usize,
     /// Host memory in MB for conversation states that a request with another history replaced (GPU): a later request
     /// that continues one of them takes it back instead of prefilling it again. 0 keeps none.
     #[arg(long, default_value_t = 4096)]
     cache_ram: usize,
+    /// GGUF LoRA adapter(s) to apply at runtime as "path:scale" (repeatable; CPU and GPU).
+    #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
+    lora: Vec<String>,
     /// Keep the think block of earlier replies in the prompt (Qwen3.5/3.6 templates' `preserve_thinking`; a request
     /// can set it in `chat_template_kwargs`). The template drops it from replies before the last user message, so
     /// each new user message changes the earlier text and the whole conversation is prefilled again; with this, a
@@ -121,6 +132,10 @@ struct Hosting {
     /// [default: no limit besides `--max-waiting`].
     #[arg(long)]
     max_per_key: Option<usize>,
+    /// Extra `Host` header names accepted by the chat page, model list and stats, comma-separated. Needed when the
+    /// server is reached through a LAN name while bound to `0.0.0.0`. [default: $STRATA_ALLOWED_HOSTS]
+    #[arg(long, value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
     /// Most reply tokens a request may ask for (and the default when it asks for none) [default: what the context
     /// leaves].
     #[arg(long)]
@@ -168,6 +183,10 @@ impl Runner<'_> {
     }
     /// Seconds spent waiting on CPU experts so far (GPU only).
     fn cpu_secs(&self) -> f64 { if let Runner::Gpu(g) = self { g.parts().map(|p| p.cpu_time.as_secs_f64()).sum() } else { 0.0 } }
+    /// Bytes of routed-expert weights one decode token reads from the cache (0 without an expert cache).
+    fn expert_bytes_per_token(&self) -> usize {
+        if let Runner::Gpu(g) = self { g.parts().map(|p| p.expert_bytes_per_token()).sum() } else { 0 }
+    }
     /// Split model: seconds per part but the last (forward until its GPU is done, copy to the next part).
     fn split_secs(&self) -> Vec<(f64, f64)> {
         let Runner::Gpu(g) = self else { return vec![] };
@@ -175,16 +194,52 @@ impl Runner<'_> {
         v.pop();
         v
     }
+    /// Backend name of the first part (`"cpu"` on the CPU, `"slot"` for a serve slot).
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Runner::Cpu(..) => "cpu",
+            Runner::Gpu(g) => g.parts().next().map_or("cpu", |p| p.gpu.name()),
+            Runner::Slot(_) => "slot",
+        }
+    }
+    /// Expert-cache counters summed over the parts, for `finish()` and the benchmark JSON (`None` off the GPU).
+    fn expert_stats(&self) -> Option<ExpertStats> {
+        let Runner::Gpu(g) = self else { return None };
+        let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
+        let parts: Vec<_> = g.parts().collect();
+        let cached: Vec<_> = parts.iter().filter(|p| p.cache.is_some()).collect();
+        Some(ExpertStats {
+            hits: sum(&|p| p.hits),
+            misses: sum(&|p| p.misses),
+            swaps: sum(&|p| p.cache.as_ref().map_or(0, |c| c.swaps)),
+            resident: sum(&|p| p.cache.as_ref().map_or(0, |c| c.resident_count())),
+            total: sum(&|p| p.cache.as_ref().map_or(0, |c| c.total_experts())),
+            bytes_per_token: sum(&|p| p.expert_bytes_per_token()),
+            cached: !cached.is_empty(),
+            all_fast: cached.iter().all(|p| p.expert_fast_path()),
+        })
+    }
+    /// The same counters, but only when an expert cache exists (the benchmark record's top-level `expert`).
+    fn expert_summary(&self) -> Option<ExpertStats> {
+        self.expert_stats().filter(|s| s.cached)
+    }
     fn finish(&self) -> anyhow::Result<()> {
         if let Runner::Gpu(g) = self {
             let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
-            let (hits, misses) = (sum(&|p| p.hits), sum(&|p| p.misses));
+            let st = self.expert_stats().expect("Runner::Gpu has expert stats");
             if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
             if g.ngram.0 > 0 { eprintln!("n-gram drafts accepted {}/{} ({:.1}%)", g.ngram.1, g.ngram.0, 100.0 * g.ngram.1 as f64 / g.ngram.0 as f64); }
-            eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * hits as f64 / (hits + misses).max(1) as f64, misses,
-                sum(&|p| p.cache.as_ref().map_or(0, |c| c.swaps)));
-            let resumed = sum(&|p| p.resumed.get());
-            if resumed > 0 { eprintln!("GPU waits for the CPU expert worker that timed out and resumed: {resumed}"); }
+            eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * st.hits as f64 / (st.hits + st.misses).max(1) as f64, st.misses, st.swaps);
+            // Issue #34 R1: printed on every run, so a fully resident run reads as a measured 0 in the log instead of
+            // an absent line. `tokens` counts the token forwards the worker could have been asked about.
+            let tokens = sum(&|p| p.tokens);
+            let busy: f64 = g.parts().map(|p| p.cpu_time.as_secs_f64()).sum();
+            let stalls = sum(&|p| p.resumed.get());
+            eprintln!("worker busy {:.1} µs/token, worker stalls {stalls}", if tokens > 0 { 1e6 * busy / tokens as f64 } else { 0.0 });
+            let mode = if !st.cached { "no expert cache".to_string() }
+                else if st.all_fast { format!("fast path on, {}/{} experts resident", st.resident, st.total) }
+                else { format!("fast path off, {}/{} experts resident", st.resident, st.total) };
+            eprintln!("mailbox traffic: {} GPU writes, {} host routing reads ({mode})", sum(&|p| p.mailbox_writes.get()), sum(&|p| p.mailbox_reads.get()));
             for p in g.parts() { if let Some(c) = &p.cache { c.save_profile()?; } }
         }
         Ok(())
@@ -192,8 +247,26 @@ impl Runner<'_> {
 }
 
 impl Engine {
+    /// Hand `--backend` and `--device` to the DeepSeek, GLM and Gemma 4 paths, which read them from the environment.
+    fn ds_env(&self) {
+        // SAFETY: called at the start of a command, before any thread reads these variables.
+        if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
+        if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
+    }
+
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
+    fn ram_cap(&self) -> Option<u64> { memory::ram_cap((self.ram_margin as u64) << 20, (self.max_ram as u64) << 20) }
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
+        if let Some(cap) = self.ram_cap() {
+            let used = m.ram_estimate() as u64;
+            anyhow::ensure!(used <= cap, "model needs ~{} MB of host RAM (baked tensors, LoRA), over the {} MB cap; lower --ram-margin or raise --max-ram", used >> 20, cap >> 20);
+            let want = (self.cache_ram as u64) << 20;
+            let room = cap - used;
+            if want > room {
+                eprintln!("RAM cap: clamping --cache-ram from {} MB to {} MB", self.cache_ram, room >> 20);
+                self.cache_ram = (room >> 20) as usize;
+            }
+        }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
         if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
         let open = || self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>();
@@ -211,14 +284,22 @@ impl Engine {
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
         if let Some(n) = self.threads.or(get("threads")) { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
         let Some(bk) = bk else {
-            if self.parallel > 1 { eprintln!("--parallel: the CPU runs one request at a time"); }
+            let (notes, _, mtp) = resolve_flags(false, self.parallel, self.mtp(), m.cfg.n_nextn, m.cfg.hc_n, false)?;
+            for n in notes { eprintln!("{n}"); }
+            self.mtp = Some(mtp);
             return Ok(Runner::Cpu(m, State::new(&m.cfg)));
         };
+        let split = bk.len() > 1;
+        let (notes, parallel, mtp) = resolve_flags(true, self.parallel, self.mtp(), m.cfg.n_nextn, m.cfg.hc_n, split)?;
+        for n in notes { eprintln!("{n}"); }
+        (self.parallel, self.mtp) = (parallel, Some(mtp));
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         if self.ngram > 0 { unsafe { std::env::set_var("STRATA_NGRAM", "1") } }  // read by GpuModel::load_part
+        // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
+        // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
+        let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
+        for b in &bk { b.preflight(&types, false)?; }
         let mut g = if self.parallel > 1 {
-            if self.mtp() > 0 { eprintln!("--parallel: decoding without MTP drafts"); }
-            self.mtp = Some(0);
             GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, 0, self.parallel).context(LOAD_HINT)?
         } else {
             GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp(), 1).context(LOAD_HINT)?
@@ -227,10 +308,6 @@ impl Engine {
         g.cache_ram = self.cache_ram << 20;
         if self.ngram > 0 && g.snaps < NGRAM_DRAFTS {
             eprintln!("--ngram: not supported for this model or setup (--parallel, several GPUs, hyper-connections, PLE or QSA), decoding without it");
-        }
-        if self.mtp() > 0 && g.k == 0 {
-            eprintln!("--mtp: this model has no MTP draft head (or it is split over GPUs), decoding without it");
-            self.mtp = Some(0);
         }
         Ok(Runner::Gpu(Box::new(g)))
     }
@@ -264,11 +341,176 @@ fn seed(s: Option<u64>) -> u64 {
 
 const LOAD_HINT: &str = "loading the model onto the GPU failed (if VRAM ran out: lower --ctx, add --kv q8, or close programs using VRAM)";
 
+/// Settle the flag combinations that cannot all take effect: an invalid request (`--parallel` outside 1..=255) is an
+/// error; a feature that cannot run is turned off with one message naming the flag and the reason. `parallel` 0 means
+/// "not set" (commands other than `serve`), treated as one slot. Returns the notices, the slots in effect and the MTP
+/// drafts in effect.
+fn resolve_flags(gpu: bool, parallel: usize, mtp: usize, n_nextn: usize, hc_n: usize, split: bool) -> anyhow::Result<(Vec<String>, usize, usize)> {
+    let p = parallel.max(1);
+    anyhow::ensure!((1..=255).contains(&p), "--parallel {parallel}: 1 to 255 slots");
+    let mut notes = vec![];
+    if !gpu {
+        if p > 1 { notes.push(format!("--parallel {p}: requires --gpu (the CPU answers one request at a time)")); }
+        if mtp > 0 { notes.push(format!("--mtp {mtp}: requires --gpu: decoding without drafts")); }
+        return Ok((notes, p, 0));
+    }
+    if p > 1 && mtp > 0 {
+        notes.push(format!("--parallel {p} and --mtp {mtp}: not supported together, decoding without MTP drafts"));
+        return Ok((notes, p, 0));
+    }
+    let why = if mtp == 0 { None }
+        else if split { Some("not available with a multi-GPU layer split") }
+        else if hc_n > 0 { Some("not supported for this model (hyper-connections)") }
+        else if n_nextn == 0 { Some("this model has no MTP head") }
+        else { None };
+    let mut k = mtp;
+    if let Some(why) = why { notes.push(format!("--mtp {mtp}: {why}: decoding without drafts")); k = 0; }
+    Ok((notes, p, k))
+}
+
 /// Calibration file for `model` on `backend`; CUDA keeps the original name.
 fn calibration_path(model: &Path, backend: &str) -> PathBuf {
     let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
     let sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
     rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}.json"))
+}
+
+impl Engine {
+    pub fn lora_specs(&self) -> Vec<(String, f32)> {
+        self.lora.iter().map(|s| {
+            if let Some(idx) = s.rfind(':') {
+                if let Ok(scale) = s[idx+1..].parse::<f32>() {
+                    return (s[..idx].to_string(), scale);
+                }
+            }
+            (s.clone(), 1.0)
+        }).collect()
+    }
+}
+
+/// Expert-cache counters summed over the GPU parts (`Runner::finish` and the benchmark JSON share them).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExpertStats {
+    hits: usize,
+    misses: usize,
+    swaps: usize,
+    resident: usize,
+    total: usize,
+    bytes_per_token: usize,
+    /// At least one part has an expert cache.
+    cached: bool,
+    /// Every part with a cache takes the fully-resident fast path.
+    all_fast: bool,
+}
+
+/// Round to the one decimal the text block prints, so the JSON carries exactly those digits (no second, different
+/// rounding of the raw float).
+fn round1(x: f64) -> f64 {
+    format!("{x:.1}").parse().unwrap_or(x)
+}
+
+/// Mean/min/max of a benchmark series. The text block and the JSON record both read these fields, so the numbers
+/// cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Stat {
+    mean: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Stat {
+    fn of(v: &[f64]) -> Self {
+        if v.is_empty() { return Self { mean: 0.0, min: 0.0, max: 0.0 }; }
+        // The same fold as the text block always used, so formatting cannot change any printed digit.
+        let (lo, hi) = v.iter().fold((f64::INFINITY, 0f64), |(a, b), &x| (a.min(x), b.max(x)));
+        Self { mean: round1(v.iter().sum::<f64>() / v.len() as f64), min: round1(lo), max: round1(hi) }
+    }
+    /// The `MEAN (MIN-MAX)` field of the `pp …` line.
+    fn text(&self) -> String { format!("{:.1} ({:.1}-{:.1})", self.mean, self.min, self.max) }
+}
+
+/// The run-wide values of a `strata bench` invocation (`strata.bench.v1`).
+struct BenchMeta<'a> {
+    backend: &'a str,
+    backend_arg: Option<&'a str>,
+    device: &'a [usize],
+    model: &'a Path,
+    ctx: usize,
+    chunk: usize,
+    kv: &'a str,
+    mtp: usize,
+    tg: usize,
+    reps: usize,
+}
+
+/// One `--pp` length: the two `Stat`s the text prints and what the expert record needs.
+struct BenchResult {
+    pp: usize,
+    prefill: Stat,
+    decode: Stat,
+    /// Bytes of expert weights one decode token reads (0 without an expert cache: no `expert` object).
+    bytes_per_token: usize,
+    /// The same median decode rate the `expert traffic:` line prints.
+    decode_median: f64,
+}
+
+/// The `strata.bench.v1` record. Pure so it can be tested without a model or a GPU.
+fn bench_record(meta: &BenchMeta, results: &[BenchResult], expert: Option<&ExpertStats>, unix_time: u64) -> serde_json::Value {
+    let mut v = json!({
+        "schema": "strata.bench.v1",
+        "unix_time": unix_time,
+        "backend": meta.backend,
+        "device": meta.device,
+        "model": {
+            "path": meta.model.display().to_string(),
+            "name": meta.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        },
+        "ctx": meta.ctx,
+        "chunk": meta.chunk,
+        "kv": meta.kv,
+        "mtp": meta.mtp,
+        "tg": meta.tg,
+        "reps": meta.reps,
+    });
+    if let Some(b) = meta.backend_arg { v["backend_arg"] = json!(b); }
+    let results: Vec<_> = results.iter().map(|r| {
+        let mut o = json!({
+            "pp": r.pp,
+            "prefill_tok_s": {"mean": r.prefill.mean, "min": r.prefill.min, "max": r.prefill.max},
+            "decode_tok_s": {"mean": r.decode.mean, "min": r.decode.min, "max": r.decode.max},
+        });
+        if r.bytes_per_token > 0 {
+            o["expert"] = json!({
+                "bytes_per_token": r.bytes_per_token,
+                "mb_per_token": round1(r.bytes_per_token as f64 / 1048576.0),
+                "gb_per_s": round1(r.bytes_per_token as f64 * r.decode_median / 1e9),
+                "at_decode_tok_s": round1(r.decode_median),
+            });
+        }
+        o
+    }).collect();
+    v["results"] = json!(results);
+    if let Some(e) = expert {
+        v["expert"] = json!({
+            "hit_rate_pct": round1(100.0 * e.hits as f64 / (e.hits + e.misses).max(1) as f64),
+            "misses": e.misses,
+            "swaps": e.swaps,
+            "resident": e.resident,
+            "total": e.total,
+            "bytes_per_token": e.bytes_per_token,
+            "mb_per_token": round1(e.bytes_per_token as f64 / 1048576.0),
+        });
+    }
+    v
+}
+
+/// `--json-out` values: a file path, never `-` (stdout keeps the text block).
+fn json_out_path(s: &str) -> Result<PathBuf, String> {
+    if s == "-" {
+        Err("`-` is not a file: stdout carries the text block, give a path".into())
+    } else {
+        Ok(PathBuf::from(s))
+    }
 }
 
 #[derive(Subcommand)]
@@ -342,8 +584,12 @@ enum Cmd {
         vram_margin: usize,
         #[arg(long)]
         backend: Option<String>,
-        #[arg(long, default_value_t = 0)]
-        device: usize,
+        /// GPU index, or several separated by commas (such as 0,1) to calibrate the layer split over those GPUs.
+        #[arg(long, default_value = "0", value_delimiter = ',')]
+        device: Vec<usize>,
+        /// Accepted for consistency with the other commands; calibration always uses the base model.
+        #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
+        lora: Vec<String>,
         /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
         #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
         kv: String,
@@ -351,8 +597,21 @@ enum Cmd {
         #[arg(long, hide = true)]
         gpu: bool,
     },
+    /// Check that every Vulkan pipeline this model needs fits the device's `maxComputeSharedMemorySize`, naming the
+    /// kernel, specialization, bytes needed and limit when one does not; exits non-zero on overflow. No model is
+    /// loaded, no weight uploaded and no pipeline created: it is SPIR-V plus spec-constant arithmetic only.
+    Check {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        device: usize,
+    },
     /// Speed test: for each prompt length, prefill that many tokens of prose, then greedily decode `tg` more at that
     /// depth. Prints prefill and decode tok/s as mean (min-max) over `reps` runs. `--ctx` grows to fit.
+    /// `--json-out PATH` also writes the same numbers as one `strata.bench.v1` JSON object plus a newline (`-` is
+    /// rejected: stdout keeps the text block).
     Bench {
         #[arg(long)]
         model: PathBuf,
@@ -362,6 +621,8 @@ enum Cmd {
         tg: usize,
         #[arg(long, default_value_t = 3)]
         reps: usize,
+        #[arg(long, value_parser = json_out_path)]
+        json_out: Option<PathBuf>,
         #[command(flatten)]
         engine: Engine,
     },
@@ -404,7 +665,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(p) = &cli.ple { unsafe { std::env::set_var("STRATA_PLE", p) } }  // read by Gguf::open
     let Some(cmd) = cli.cmd else {
         // Started without arguments, as by a double click: keep the window open on an error so it can be read.
-        let Some(Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine }) = Cli::parse_from(["strata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
+        let Some(Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine }) = Cli::parse_from(["rustingstrata", "serve", "--gpu", "--open"]).cmd else { unreachable!() };
         engine.cpu_fallback = true;
         let r = run(Cmd::Serve { model, models_dir, addr, api_key, open, host, engine });
         if let Err(e) = &r {
@@ -444,7 +705,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
                 anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
             }
@@ -463,8 +725,22 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             println!("{}", serde_json::json!({"argmax": argmax, "top5": top5}));
         }
         Cmd::Generate { model, prompt, n, mut engine } => {
+            engine.ds_env();
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::gemma4::generate(&g, &prompt, n);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::glm::generate(&g, &prompt, n);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::deepseek::chat::generate(&g, &prompt, n);
+            }
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -493,7 +769,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
             let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
@@ -526,12 +803,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             println!("\nPPL = {:.4} over {n_chunk} chunks of {n} tokens ({count} scored)", (nll / count as f64).exp());
             r.finish()?;
         }
-        Cmd::Bench { model, pp, tg, reps, mut engine } => {
+        Cmd::Bench { model, pp, tg, reps, json_out, mut engine } => {
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             let mut r = engine.runner(&m, &model)?;
+            let mut results = Vec::with_capacity(pp.len());
             for n in pp {
                 let ids = prose(&tok, n)?;
                 let (mut p, mut d) = (Vec::new(), Vec::new());
@@ -544,21 +823,79 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let k = decode(&mut r, &tok, engine.mtp() > 0, engine.ngram, &ids, &mut Sampler::greedy(), l, tg, &mut |_| Ok(false))?.0.len();
                     d.push(k as f64 / t.elapsed().as_secs_f64());
                 }
-                let stat = |v: &[f64]| {
-                    let (lo, hi) = v.iter().fold((f64::INFINITY, 0f64), |(a, b), &x| (a.min(x), b.max(x)));
-                    format!("{:.1} ({lo:.1}-{hi:.1})", v.iter().sum::<f64>() / v.len() as f64)
-                };
-                println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", stat(&p), stat(&d));
+                let (prefill, decode_stat) = (Stat::of(&p), Stat::of(&d));
+                println!("pp {n:6}: prefill {} tok/s | tg {tg}: decode {} tok/s", prefill.text(), decode_stat.text());
+                // R3: the attained expert-read bandwidth (bytes per token x tokens per second), against the ~900 GB/s
+                // of the V100, for the prefetch decision the window records.
+                let eb = r.expert_bytes_per_token();
+                let mid = if eb > 0 {
+                    let mid = { let mut v = d.clone(); v.sort_by(f64::total_cmp); v[v.len() / 2] };
+                    eprintln!("expert traffic: {:.1} MB/token -> {:.1} GB/s at {mid:.1} tok/s", eb as f64 / 1048576.0, eb as f64 * mid / 1e9);
+                    mid
+                } else { 0.0 };
+                results.push(BenchResult { pp: n, prefill, decode: decode_stat, bytes_per_token: eb, decode_median: mid });
             }
             r.finish()?;
+            // After `finish()`: the expert counters are final, and the record cannot reorder `save_profile()`.
+            if let Some(path) = json_out {
+                let device: &[usize] = if r.backend_name() == "cpu" { &[] } else { &engine.device };
+                let meta = BenchMeta {
+                    backend: r.backend_name(),
+                    backend_arg: engine.backend.as_deref(),
+                    device,
+                    model: &model,
+                    ctx: engine.ctx,
+                    chunk: engine.chunk(),
+                    kv: &engine.kv,
+                    mtp: engine.mtp(),
+                    tg,
+                    reps,
+                };
+                let unix_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let record = bench_record(&meta, &results, r.expert_summary().as_ref(), unix_time);
+                let mut line = serde_json::to_string(&record)?;
+                line.push('\n');
+                std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
+            }
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, gpu: _ } => {
+        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
-            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
+            if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
+            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), &device)?
+        }
+        Cmd::Check { model, backend, device } => {
+            let g = Gguf::open(&model)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                let c = rusting_strata::deepseek::DsConfig::from_gguf(&g)?;
+                c.validate(&g)?;
+                println!("check: deepseek41 ok: {} layers, {} experts ({} used), {} tensors, tensor table valid (CPU reference only; no GPU path yet)", c.n_layer, c.n_expert, c.n_used, g.tensors.len());
+                return Ok(());
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+                let c = rusting_strata::glm::GlmConfig::from_gguf(&g)?;
+                c.validate(&g)?;
+                println!("check: glm5-next ok: {} layers ({} KDA, {} DSA) + {} NextN, {} experts ({} used), {} tensors, tensor table valid", c.n_layer, c.n_kda(), c.n_dsa(), c.n_nextn, c.n_expert, c.n_used, g.tensors.len());
+                return Ok(());
+            }
+            let types = rusting_strata::gpu_model::gpu_weight_types(&g);
+            let b = backend::open(backend.as_deref(), device)?;
+            if b.name() != "vulkan" {
+                eprintln!("check: the shared-memory preflight is Vulkan-only; nothing to check on {}", b.name());
+                return Ok(());
+            }
+            b.preflight(&types, true)?;
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
+            engine.ds_env();
             let g = Gguf::open(&model)?;
-            let m = Model::load(&g)?;
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+                return rusting_strata::glm::chat(&g, system, n);
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                return rusting_strata::deepseek::chat::chat(&g, system, n, think);
+            }
+            let mut m = Model::load(&g)?;
+            if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut smp = engine.sampler();
@@ -580,9 +917,28 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Serve { model, models_dir, addr, api_key, open, host, mut engine } => {
+            engine.ds_env();
+            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
+                let name = mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned());
+                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
+                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+                return rusting_strata::glm::serve(&g, &name, &addr, key.as_deref());
+            }
+            if let Some(mp) = &model && let Ok(g) = Gguf::open(mp) && g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
+                let name = mp.file_name().map_or("deepseek".into(), |n| n.to_string_lossy().into_owned());
+                let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
+                anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+                return rusting_strata::deepseek::chat::serve(&g, &name, &addr, key.as_deref());
+            }
             engine.parallel = host.parallel;
+            // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
+            anyhow::ensure!((1..=255).contains(&engine.parallel), "--parallel {}: 1 to 255 slots", engine.parallel);
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
+            let mut allowed_hosts = host.allowed_hosts.clone();
+            if allowed_hosts.is_empty() && let Ok(v) = std::env::var("STRATA_ALLOWED_HOSTS") {
+                allowed_hosts.extend(v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned));
+            }
             let mut keys_time = host.api_keys.as_ref().and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
             let users = match &host.api_keys {
                 Some(f) => serve::Keys::parse(&std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?)
@@ -612,7 +968,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let open_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let waiting = open_conns.clone();
             let stats = std::sync::Arc::new(std::sync::Mutex::new(serve::Stats::default()));
-            let (st, a, k, t0) = (stats.clone(), addr.clone(), keys.clone(), Instant::now());
+            let (st, a, k, allowed, t0) = (stats.clone(), addr.clone(), keys.clone(), allowed_hosts.clone(), Instant::now());
             let (per_key, held) = (host.max_per_key, serve::Open::default());
             let stop = on_sigterm();
             // SIGTERM (systemctl stop or restart): new requests get 503, the requests accepted before it finish, then
@@ -658,7 +1014,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         Err(e) => eprintln!("{}: {e:#}, keeping the old keys", f.display()),
                     }
                 }
-                let (tx, oc, st, a, k, held) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), held.clone());
+                let (tx, oc, st, a, k, allowed, held) = (tx.clone(), open_conns.clone(), st.clone(), a.clone(), k.clone(), allowed.clone(), held.clone());
                 std::thread::spawn(move || {
                     let q = c.set_read_timeout(Some(Duration::from_secs(30))).and_then(|_| c.set_write_timeout(Some(Duration::from_secs(30))))
                         .map_err(Into::into).and_then(|_| serve::read_request(&mut BufReader::new(&c)));
@@ -677,7 +1033,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     // The page's side panel is answered here, so it stays current while a reply is generated or a
                     // model loads. A bad Host or key falls through to `handle`, which refuses it.
                     if let Ok(r) = &q && r.method == "GET" && matches!(r.path.as_str(), "/api/stats" | "/metrics") && let k = k.read().unwrap().clone()
-                        && (k.any() || serve::host_ok(&r.host, &a)) && k.who(&r.auth).is_some_and(|w| w.admin) {
+                        && (k.any() || serve::host_ok(&r.host, &a, &allowed)) && k.who(&r.auth).is_some_and(|w| w.admin) {
                         if r.path == "/metrics" {
                             let b = st.lock().unwrap().prometheus(oc.load(Relaxed) - 1, t0.elapsed().as_secs());
                             let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
@@ -698,7 +1054,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                             eprintln!("request {i}: {e:#}");
                             return reply(json!({"error": {"message": format!("{e:#}"), "type": "invalid_request_error"}}), "400 Bad Request");
                         }
-                        Ok(r) if r.method == "GET" && r.path == "/" && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
+                        Ok(r) if r.method == "GET" && r.path == "/" && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed)) => {
                             let _ = write!(&c, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len());
                             oc.fetch_sub(1, Relaxed);
                             return;
@@ -706,10 +1062,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         Ok(_) if who.is_none() =>
                             return reply(json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}}), "401 Unauthorized"),
                         // Clients list the models often; a model still loading is listed, as its chats wait for the load.
-                        Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a)) => {
+                        Ok(r) if r.method == "GET" && r.path.split('?').next() == Some("/v1/models") && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed)) => {
                             let created = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                            let m = st.lock().unwrap().model.clone();
-                            return reply(json!({"object": "list", "data": m.map(|id| json!([{"id": id, "object": "model", "created": created, "owned_by": "strata"}])).unwrap_or(json!([]))}), "200 OK");
+                            let (m, n_ctx, n_ctx_train) = {
+                                let state = st.lock().unwrap();
+                                (state.model.clone(), state.ctx, state.ctx_train)
+                            };
+                            return reply(json!({"object": "list", "data": m.map(|id| json!([{
+                                "id": id, "object": "model", "created": created, "owned_by": "strata",
+                                "meta": {"n_ctx": n_ctx, "n_ctx_train": n_ctx_train}
+                            }])).unwrap_or(json!([]))}), "200 OK");
                         }
                         _ => {}
                     }
@@ -730,7 +1092,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let _ = tx.send((c, q, i, hold));
                 });
             });
-            let s = Serving { rx: rx.into(), waiting, stop, addr, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
+            let s = Serving { rx: rx.into(), waiting, stop, addr, allowed_hosts, keys, usage, max_tokens: host.max_tokens.unwrap_or(usize::MAX), dir: models_dir.unwrap_or_else(models_dir_default), model: model.clone(),
                 dl: Default::default(), stats };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
@@ -780,7 +1142,7 @@ fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize) -> anyhow::Result<()> {
+fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: &[usize]) -> anyhow::Result<()> {
     let g = Gguf::open(model)?;
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
@@ -788,7 +1150,9 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     anyhow::ensure!(n_pf >= 512, "--ctx too small to calibrate");
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
-        let mut gm = GpuModel::load(&m, backend::open(kind, device)?, ctx, chunk, margin, 3).context(LOAD_HINT)?;
+        let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
+        // MTP is not available with a layer split (as in serve): no drafts to measure.
+        let mut gm = GpuModel::load_split(&m, bk, ctx, chunk, margin, if device.len() > 1 { 0 } else { 3 }, 1).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };
@@ -945,6 +1309,7 @@ struct Serving {
     /// Set by SIGTERM.
     stop: &'static std::sync::atomic::AtomicBool,
     addr: String,
+    allowed_hosts: Vec<String>,
     keys: std::sync::Arc<std::sync::RwLock<serve::Keys>>,
     usage: Option<std::sync::Mutex<std::fs::File>>,
     max_tokens: usize,
@@ -1206,9 +1571,17 @@ impl Serving {
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
     eprintln!("loading {}", model.display());
     let name = model.file_stem().and_then(|s| s.to_str()).unwrap_or("strata").to_string();
-    s.stats.lock().unwrap().unload(Some(name.clone()));
+    {
+        let mut st = s.stats.lock().unwrap();
+        st.unload(Some(name.clone()));
+        st.ctx = engine.ctx;
+        st.ram_cap = engine.ram_cap();
+    }
     let g = Gguf::open(model)?;
-    let m = Model::load(&g)?;
+    let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
+    s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
+    let mut m = Model::load(&g)?;
+    if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
     let r = engine.runner(&m, model)?;
     {
@@ -1289,7 +1662,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // makes a cross-site POST need a CORS preflight, which is never answered.
     // With a key the check is not needed (a rebinding page has no key) and would refuse a reverse proxy's Host.
     let keys = s.keys.read().unwrap().clone();
-    if !keys.any() && !serve::host_ok(&host, &s.addr) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
+    if !keys.any() && !serve::host_ok(&host, &s.addr, &s.allowed_hosts) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header", "type": "forbidden"}})); }
     let Some(who) = keys.who(&auth) else { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})) };
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     // Claude Code adds `?beta=true`.
@@ -1374,6 +1747,10 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let n_sys = req.messages.iter().take_while(|m| m.role == "system").count();
             let system = tpl.render(&req.messages[..n_sys], &req.tools, think, preserve, false);
             let ids = tok.encode(&prompt)?;
+            // One line per chat request, and one when it finishes (see `log` below).
+            let key_name = if who.name.is_empty() { "open" } else { who.name.as_str() };
+            eprintln!("request: {method} {p} key={key_name} model={name} prompt={} tok stream={} tools={}",
+                ids.len(), req.stream, req.tools.len());
             let mut smp = e.sampler();
             smp.temp = req.temperature.unwrap_or(smp.temp);
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
@@ -1422,14 +1799,21 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
+                let mut last_stream_activity = Instant::now();
                 decode(r, tok, e.mtp() > 0, e.ngram, &ids, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     // A client that left stops the reply (a stream notices on the next write; held text writes nothing).
                     k += 1;
                     if k % 16 == 0 && serve::gone(&w) { anyhow::bail!("client closed the connection"); }
                     let t = hold.push(t);
-                    if req.stream && !t.is_empty() {
-                        if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                    if req.stream {
+                        if !t.is_empty() {
+                            if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                            last_stream_activity = Instant::now();
+                        } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
+                            w.write_all(b": keep-alive\n\n")?;
+                            last_stream_activity = Instant::now();
+                        }
                     }
                     Ok(hold.stopped)
                 })
@@ -1443,11 +1827,22 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
             let mut last = serve::Last { at: created, model: name.into(), system_tokens: n_system, cached_tokens: cached,
                 prompt_tokens: ids.len(), completion_tokens: k, prefill_ms: ms(t1 - t0), decode_ms: ms(decoded), finish: String::new() };
-            let log = |last: &serve::Last| if let Some(f) = &s.usage {
-                let mut v = json!(last);
-                v["key"] = who.name.clone().into();
-                // A failed write must not fail the reply; it is reported.
-                if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
+            let log = |last: &serve::Last| {
+                let decode_s = last.decode_ms / 1e3;
+                let prefill_s = last.prefill_ms / 1e3;
+                // Cached prompt tokens were not prefilled again, so they do not count toward the prefill speed.
+                let new_prompt = last.prompt_tokens.saturating_sub(last.cached_tokens);
+                let decode_tps = if decode_s > 0.0 { last.completion_tokens as f64 / decode_s } else { 0.0 };
+                let prefill_tps = if prefill_s > 0.0 { new_prompt as f64 / prefill_s } else { 0.0 };
+                eprintln!("done: key={key_name} model={} prompt={} tok ({} cached) -> {} tok in {decode_s:.2} s, \
+                    decode {decode_tps:.1} tok/s, prefill {prefill_tps:.1} tok/s, finish={}",
+                    last.model, last.prompt_tokens, last.cached_tokens, last.completion_tokens, last.finish);
+                if let Some(f) = &s.usage {
+                    let mut v = json!(last);
+                    v["key"] = who.name.clone().into();
+                    // A failed write must not fail the reply; it is reported.
+                    if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { eprintln!("usage log: {err}"); }
+                }
             };
             // The next request starts from the saved history state or from scratch. A stream that already started is just cut off.
             let (out, stop) = match res {
@@ -1519,5 +1914,174 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             }
         }
         _ => send(&mut w, "404 Not Found", json!({"error": {"message": format!("no route {method} {path}"), "type": "not_found"}})),
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::resolve_flags;
+
+    #[test]
+    fn parallel_mtp_are_explained() {
+        // `--parallel` with MTP: MTP off, one message naming both flags.
+        let (n, p, k) = resolve_flags(true, 4, 1, 1, 0, false).unwrap();
+        assert_eq!((p, k), (4, 0));
+        assert_eq!(n, ["--parallel 4 and --mtp 1: not supported together, decoding without MTP drafts"]);
+    }
+
+    #[test]
+    fn mtp_without_a_head_runs_without_drafts() {
+        let (n, _, k) = resolve_flags(true, 1, 3, 0, 0, false).unwrap();
+        assert_eq!(k, 0);
+        assert_eq!(n, ["--mtp 3: this model has no MTP head: decoding without drafts"]);
+        // A model with a head keeps its drafts.
+        let (n, _, k) = resolve_flags(true, 1, 3, 1, 0, false).unwrap();
+        assert!(n.is_empty() && k == 3);
+        // A layer split or hyper-connections explain themselves instead.
+        for (split, hc, why) in [(true, 0, "not available with a multi-GPU layer split"),
+                                 (false, 4, "not supported for this model (hyper-connections)")] {
+            let (n, _, k) = resolve_flags(true, 1, 3, 1, hc, split).unwrap();
+            assert_eq!(k, 0);
+            assert_eq!(n, [format!("--mtp 3: {why}: decoding without drafts")]);
+        }
+    }
+
+    #[test]
+    fn cpu_requires_the_gpu_for_both() {
+        let (n, _, k) = resolve_flags(false, 2, 1, 1, 0, false).unwrap();
+        assert_eq!(k, 0);
+        assert_eq!(n, ["--parallel 2: requires --gpu (the CPU answers one request at a time)",
+                       "--mtp 1: requires --gpu: decoding without drafts"]);
+        // No flags set (0 means unset) prints nothing.
+        assert_eq!(resolve_flags(false, 0, 0, 0, 0, false).unwrap(), (vec![], 1, 0));
+    }
+
+    #[test]
+    fn parallel_range_is_rejected() {
+        for n in [256, 1000] {
+            let e = resolve_flags(true, n, 0, 0, 0, false).unwrap_err().to_string();
+            assert_eq!(e, format!("--parallel {n}: 1 to 255 slots"));
+        }
+        assert!(resolve_flags(true, 255, 0, 0, 0, false).is_ok());
+        assert_eq!(resolve_flags(true, 1, 0, 0, 0, false).unwrap(), (vec![], 1, 0));
+    }
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::{bench_record, round1, BenchMeta, BenchResult, Cli, ExpertStats, Stat};
+    use clap::Parser;
+    use serde_json::Value;
+    use std::path::Path;
+
+    fn meta() -> BenchMeta<'static> {
+        BenchMeta {
+            backend: "cpu",
+            backend_arg: None,
+            device: &[],
+            model: Path::new("/mnt/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"),
+            ctx: 32896,
+            chunk: 4096,
+            kv: "f16",
+            mtp: 0,
+            tg: 128,
+            reps: 3,
+        }
+    }
+
+    fn result(pp: usize, prefill: Stat, decode: Stat) -> BenchResult {
+        BenchResult { pp, prefill, decode, bytes_per_token: 0, decode_median: decode.mean }
+    }
+
+    fn parsed(record: &Value) -> Value {
+        // One compact object plus a newline is what reaches the file: it must parse back unchanged.
+        let mut line = serde_json::to_string(record).unwrap();
+        line.push('\n');
+        assert!(line.ends_with("}\n") && line.matches('\n').count() == 1);
+        serde_json::from_slice::<Value>(line.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn bench_record_schema_and_one_result_per_pp_in_order() {
+        let st = |x: f64| Stat { mean: round1(x), min: round1(x), max: round1(x) };
+        let results = [result(512, st(2135.7), st(129.5)), result(4096, st(1900.0), st(120.0)), result(32768, st(1500.0), st(80.0))];
+        let v = parsed(&bench_record(&meta(), &results, None, 1_762_617_600));
+        assert_eq!(v["schema"], "strata.bench.v1");
+        assert_eq!(v["unix_time"], 1_762_617_600u64);
+        assert_eq!(v["backend"], "cpu");
+        assert!(v.get("backend_arg").is_none());
+        assert_eq!(v["device"], serde_json::json!([]));
+        assert_eq!(v["model"]["name"], "Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf");
+        assert_eq!(v["model"]["path"], "/mnt/models/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf");
+        assert_eq!((v["ctx"].as_u64(), v["chunk"].as_u64(), v["mtp"].as_u64()), (Some(32896), Some(4096), Some(0)));
+        assert_eq!((v["tg"].as_u64(), v["reps"].as_u64()), (Some(128), Some(3)));
+        let rs = v["results"].as_array().unwrap();
+        assert_eq!(rs.iter().map(|r| r["pp"].as_u64().unwrap()).collect::<Vec<_>>(), [512, 4096, 32768]);
+        assert_eq!(rs[0]["prefill_tok_s"]["mean"], 2135.7);
+    }
+
+    #[test]
+    fn bench_record_rates_match_the_text_rendering() {
+        let raw_p = [2144.9, 2129.6, 2132.6];
+        let raw_d = [128.9, 129.8, 129.8];
+        let (p, d) = (Stat::of(&raw_p), Stat::of(&raw_d));
+        let text = format!("pp {:6}: prefill {} tok/s | tg {}: decode {} tok/s", 512, p.text(), 32, d.text());
+        let v = parsed(&bench_record(&meta(), &[result(512, p, d)], None, 0));
+        for (key, stat) in [("prefill_tok_s", p), ("decode_tok_s", d)] {
+            let o = &v["results"][0][key];
+            assert_eq!(o["mean"], stat.mean);
+            assert_eq!(o["min"], stat.min);
+            assert_eq!(o["max"], stat.max);
+            // The same decimal strings the text line carries.
+            assert!(text.contains(&format!("{:.1}", o["mean"].as_f64().unwrap())));
+        }
+        assert_eq!(format!("{:.1}", p.mean), "2135.7");
+        assert_eq!(format!("{:.1}", p.min), "2129.6");
+        assert_eq!(format!("{:.1}", p.max), "2144.9");
+        assert!(text.starts_with("pp    512: prefill 2135.7 (2129.6-2144.9) tok/s | tg 32: decode 129.5 (128.9-129.8) tok/s"));
+    }
+
+    #[test]
+    fn bench_record_omits_expert_without_a_cache() {
+        let v = parsed(&bench_record(&meta(), &[result(512, Stat { mean: 1.0, min: 1.0, max: 1.0 }, Stat { mean: 2.0, min: 2.0, max: 2.0 })], None, 0));
+        assert!(v.get("expert").is_none());
+        assert!(v["results"][0].get("expert").is_none());
+    }
+
+    #[test]
+    fn bench_record_expert_object_uses_the_printed_numbers() {
+        let stats = ExpertStats {
+            hits: 1024, misses: 0, swaps: 3, resident: 10240, total: 10240,
+            bytes_per_token: 329_006_694, cached: true, all_fast: true,
+        };
+        let mut r = result(512, Stat { mean: 2135.7, min: 2129.6, max: 2144.9 }, Stat { mean: 129.5, min: 128.9, max: 129.8 });
+        r.bytes_per_token = 329_006_694;
+        r.decode_median = 129.7;
+        let mut m = meta();
+        m.backend = "vulkan";
+        m.backend_arg = Some("vulkan");
+        m.device = &[0];
+        let v = parsed(&bench_record(&m, &[r], Some(&stats), 0));
+        assert_eq!(v["backend"], "vulkan");
+        assert_eq!(v["backend_arg"], "vulkan");
+        assert_eq!(v["device"], serde_json::json!([0]));
+        let e = &v["expert"];
+        assert_eq!(e["hit_rate_pct"], 100.0);
+        assert_eq!((e["misses"].as_u64(), e["swaps"].as_u64()), (Some(0), Some(3)));
+        assert_eq!((e["resident"].as_u64(), e["total"].as_u64()), (Some(10240), Some(10240)));
+        assert_eq!(e["bytes_per_token"], 329_006_694u64);
+        assert_eq!(e["mb_per_token"], 313.8);
+        let pe = &v["results"][0]["expert"];
+        assert_eq!(pe["bytes_per_token"], 329_006_694u64);
+        assert_eq!(pe["mb_per_token"], 313.8);
+        assert_eq!(pe["gb_per_s"], round1(329_006_694.0 * 129.7 / 1e9));
+        assert_eq!(pe["at_decode_tok_s"], 129.7);
+    }
+
+    #[test]
+    fn bench_record_rejects_json_out_dash() {
+        let e = Cli::try_parse_from(["rustingstrata", "bench", "--model", "m.gguf", "--json-out", "-"]).err().unwrap();
+        assert!(e.to_string().contains("stdout carries the text block"), "{e}");
+        assert!(Cli::try_parse_from(["rustingstrata", "bench", "--model", "m.gguf", "--json-out", "/tmp/x.json"]).is_ok());
     }
 }

@@ -4,7 +4,11 @@ All benchmarks in the README were run on an NVIDIA RTX 3060. AMD GPUs run the Vu
 (`--backend vulkan`), and everything known about them comes from user reports (RX 9070 XT on Linux with RADV, and on
 Windows with AMD's driver). Expect problems; this page lists the known ones and what to send when you hit a new one.
 
-Needs RDNA or newer (older AMD GPUs lack subgroup size 32) and a Vulkan 1.3 driver.
+Needs a Vulkan 1.3 driver and subgroup size 32 or a fixed subgroup size 64. The wave64 path has been tested on
+Radeon VII (Vega 20) with RADV Mesa 26.0.8. It runs the same int8 kernels as wave32: each 64-lane subgroup is split
+into two logical 32-lane warps. The optimized batched-prefill path can differ from token-by-token inference at near
+ties; `--chunk 0` uses token-by-token prefill when closer agreement with the CPU reference matters more than prompt
+processing speed.
 
 ## First line of the output
 
@@ -25,7 +29,7 @@ vulkan: AMD Radeon RX 9070 XT (radv Mesa 26.2.5), device-coherent memory yes, co
 While the CPU computes the experts that are not in VRAM, the GPU polls a small mailbox buffer for the answer. On AMD the
 GPU caches that buffer unless it comes from device-coherent memory (`VK_AMD_device_coherent_memory`), and then it misses
 the answer and waits until it gives up. RADV hides the extension on RDNA4 (RX 9000) unless the driconf option
-`radv_device_coherent_memory` is set. Strata sets it before it opens Vulkan (unless you set it yourself) and prints a
+`radv_device_coherent_memory` is set. RustingStrata sets it before it opens Vulkan (unless you set it yourself) and prints a
 warning when an AMD GPU still has no device-coherent memory. If the first line says `device-coherent memory no`, send
 the output of `vulkaninfo | grep -i coherent`. A few resumed waits on a busy CPU are normal; hundreds are not.
 
@@ -52,7 +56,8 @@ Environment variables; set any of them to turn the feature off:
 - `STRATA_VK_DP_OLD`: use the old per-query prefill attention fallback instead of the tiled one (A/B and rollback).
 - `STRATA_VK_NO_COND`: no conditional rendering.
 - `STRATA_VK_NO_TQ`: no separate transfer queue for expert uploads.
-- `radv_device_coherent_memory=false`: undo the RADV option strata sets.
+- `STRATA_VK_SMEM_LIMIT=49152`: treat the device as allowing this much workgroup shared memory. The AMD proprietary driver reports 32768 on an RX 9070 XT although the card has 64 KB; RustingStrata raises that to 49152 itself on RDNA3/4 cards with this driver (no kernel needs more). For any other card that reports too little, set it by hand. Do not set it above what the card really has (issue #20).
+- `radv_device_coherent_memory=false`: undo the RADV option RustingStrata sets.
 
 If one of these makes a problem go away, say which one in the report.
 
@@ -61,4 +66,4 @@ If one of these makes a problem go away, say which one in the report.
 - GPU model, OS, driver and version (Mesa version on Linux).
 - The output of `vulkaninfo --summary`.
 - The full output of the failing command, including the first `vulkan:` line.
-- If decode is slow: `strata bench --model <file> --gpu --backend vulkan --pp 1024 --tg 128` with the same model.
+- If decode is slow: `rustingstrata bench --model <file> --gpu --backend vulkan --pp 1024 --tg 128` with the same model.
