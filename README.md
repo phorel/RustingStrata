@@ -25,7 +25,7 @@ commits by 2026-11-11) and none of that is merged here. The numbers below are fr
 | Integer Q5_K CPU kernel | Q5_K experts on the CPU no longer go through the f32 fallback (the down experts of Q4_K_M files). | 35B-A3B Q4_K_M: 29 to 57 tok/s decode. |
 | `--ngram [N]` | Drafts from repeated text: when the last N tokens occurred earlier in the context, the 3 tokens that followed are verified in one forward. Output is unchanged. | 35B-A3B Q4_K_S, file rewrite: 48-52 to 72-74 tok/s; text with no repeats: 49-51 to 44-47. |
 | Integer IQ4_NL CPU kernel | The same for IQ4_NL experts (the down experts of half the layers of Qwen3.8-Flash-Next UD-IQ2_XS, every expert of IQ4_NL files). | Flash-Next UD-IQ2_XS: 7.5-7.9 to 9.8-11.3 tok/s decode. |
-| Gyro files | The trellis types TQ2_T, TQK4-TQK7 and TQP5-TQP7 and the Hadamard rotation of agentionai's Gyro quants of Qwen3.8-Flash-Next: CPU reference, integer CPU kernels, CUDA decode and batched prefill. On Vulkan, and for TQP (Gyro-L), the experts run on the CPU and the prompt goes token by token. A `-noPLE` file does not load (no option to take the n-gram table from another file). | Gyro-S: 11-15 tok/s decode, 208-222 tok/s on a 1737-token prompt. |
+| Gyro files | The trellis types TQ2_T, TQK4-TQK7 and TQP5-TQP7 and the Hadamard rotation of agentionai's Gyro quants of Qwen3.8-Flash-Next: CPU reference, integer CPU kernels, CUDA decode and batched prefill. On Vulkan, and for TQP (Gyro-L), the experts run on the CPU and the prompt goes token by token. `--ple <table.gguf>` gives a `-noPLE` file its n-gram table from another GGUF. | Gyro-S: 11-15 tok/s decode, 208-222 tok/s on a 1737-token prompt. |
 
 Qwen3.8-Flash-Next on this machine, `--ctx 8192 --chunk 512 --vram-margin 256` (the default chunk of 4096 leaves this
 model's experts almost no VRAM on 8 GB):
@@ -80,8 +80,13 @@ Other models, greedy "The capital of France is" with `--gpu` (CUDA / Vulkan, sec
 
 Supported GGUF types: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_0, Q2_K-Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
 IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, and the Gyro trellis types TQ2_T, TQK4-TQK7 and TQP5-TQP7 with their Hadamard rotation
-(agentionai Gyro files, single file with the n-gram table inside). TQ2_T and TQK run on CUDA and the CPU; on Vulkan, and
-for TQP (Gyro-L), every expert runs on the CPU and the prompt is read token by token.
+(agentionai Gyro files). TQ2_T and TQK run on CUDA and the CPU; on Vulkan, and for TQP (Gyro-L), every expert runs on
+the CPU and the prompt is read token by token. A Qwen3.8-Flash-Next file without the n-gram table (the `-noPLE` Gyro
+files) takes it from any GGUF that holds `per_layer_token_embd.weight`, named with `--ple`: a table-only file, or the
+table shard or full file of another quant. A model with its own table keeps it. Strata prints which table it took and
+refuses one whose hash constants are another model's. The answers equal the full file's only when the table is byte for
+byte the one that file ships (Gyro-S: its own IQ4_NL rounding; Gyro-M and Gyro-L: the Q8_0 table), and a file without
+the table does not record which, so that cannot be checked.
 
 ## Build
 

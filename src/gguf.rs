@@ -97,6 +97,28 @@ impl Gguf {
                 for (k, t) in s.tensors { anyhow::ensure!(g.tensors.insert(k.clone(), t).is_none(), "tensor {k} in two shards"); }
             }
         }
+        // A file without the n-gram (PLE) table takes it from the GGUF that `--ple` names, as one more shard.
+        const PLE: &str = "per_layer_token_embd.weight";
+        if g.meta.keys().any(|k| k.ends_with(".ple.layers")) && let Some(p) = std::env::var_os("STRATA_PLE") {
+            let p = Path::new(&p);
+            if g.tensors.contains_key(PLE) {
+                eprintln!("--ple: {} has its own n-gram table, which it keeps", path.display());
+            } else {
+                let mut s = Self::open_one(p, g.files.len())?;
+                let t = s.tensors.remove(PLE).with_context(|| format!("{}: no tensor {PLE}", p.display()))?;
+                // The table is indexed by hashes of token n-grams: another model's hash constants read other rows.
+                for k in ["layer_multipliers", "head_offsets", "head_vocab_sizes", "ngram_size", "heads_per_ngram"] {
+                    let v = |m: &BTreeMap<String, Value>| m.iter().find(|(n, _)| n.ends_with(&format!(".ple.{k}"))).map(|(_, v)| format!("{v:?}"));
+                    anyhow::ensure!(v(&s.meta).is_none_or(|x| Some(x) == v(&g.meta)), "{}: its n-gram table is for another model (ple.{k} differs)", p.display());
+                }
+                // Nothing in a file without the table says which rounding of it the file was made and measured with.
+                eprintln!("n-gram table: {} from {} (--ple). The answers equal those of the model's full file only if the two tables \
+                    are the same bytes; another quantization of the table changes some tokens.",
+                    GgmlType::from_u32(t.ty).map_or("?", |ty| ty.name()), p.display());
+                g.files.extend(s.files);
+                g.tensors.insert(PLE.into(), t);
+            }
+        }
         Ok(g)
     }
 

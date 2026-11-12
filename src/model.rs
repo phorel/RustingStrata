@@ -92,7 +92,8 @@ impl<'a> Model<'a> {
             let heads = (PLE_NGRAM - 1) * PLE_HEADS;
             anyhow::ensure!(ple.mult.len() == PLE_NGRAM && ple.off.len() == heads && ple.vocab.len() == heads
                 && ple.vocab.iter().all(|&v| v > 0) && heads * cfg.n_embd_ple == cfg.n_embd, "bad PLE metadata");
-            w.get("per_layer_token_embd.weight")?;
+            let t = w.get("per_layer_token_embd.weight").context("this file has no n-gram (PLE) table: name a GGUF that holds it with --ple")?;
+            anyhow::ensure!(t.cols == cfg.n_embd_ple, "the n-gram (PLE) table has rows of {}, the model takes {}", t.cols, cfg.n_embd_ple);
             Some(ple)
         } else {
             w.get("output_norm.weight")?;
