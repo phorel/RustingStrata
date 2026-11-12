@@ -370,8 +370,19 @@ fn prefill_cached_reuses_history() {
 /// batched forward after `reset`, then as a chunked prefill (last logits only).
 #[test]
 fn qwen4exp_gpu_matches_cpu() {
+    qwen4exp_matches(std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"));
+}
+
+/// The same for a Gyro file (trellis experts in a rotated basis), named by STRATA_GYRO_MODEL: the reference unrotates
+/// each dequantized row, the GPU and the CPU expert kernels rotate their input.
+#[test]
+fn gyro_gpu_matches_cpu() {
+    let Some(p) = std::env::var_os("STRATA_GYRO_MODEL") else { return };
+    qwen4exp_matches(std::path::Path::new(&p));
+}
+
+fn qwen4exp_matches(p: &std::path::Path) {
     let _gpu = common::gpu_lock();
-    let p = std::path::Path::new("/mnt/ollama/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf");
     if !p.exists() { return }
     let g = Gguf::open(p).unwrap();
     let m = Model::load(&g).unwrap();

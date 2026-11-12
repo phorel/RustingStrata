@@ -11,15 +11,15 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-const QTYPES: [GgmlType; 22] = {
+const QTYPES: [GgmlType; 27] = {
     use GgmlType::*;
-    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, Q4_1, Q5_1, Q4_0, Q5_0]
+    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, Q4_1, Q5_1, Q4_0, Q5_0, TQK4, TQK5, TQK6, TQK7, TQ2T]
 };
-const KERNELS: [&str; 35] = [
+const KERNELS: [&str; 36] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
-    "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv",
+    "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "hadamard",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -84,7 +84,9 @@ fn source(kv_q8: bool) -> String {
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
-         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n{}",
+         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
+         __device__ const unsigned short tq_cb[4096] = {{{}}};\n\
+         __device__ const unsigned short tq_cb8[2048] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -93,6 +95,9 @@ fn source(kv_q8: bool) -> String {
         join(IQ3S_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
+        join(crate::quant::tq::TQ_CODEBOOK.iter().map(|v| v.to_string()).collect()),
+        // Each point's two values times 31 (TQ8_SCALE in kernels.cu; the codebook is within ±4) as int8.
+        join((0..2048).map(|i| { let q = |j: usize| (crate::quant::tq::cb(2 * i + j) * 31.0).round() as i8 as u8 as u16; (q(0) | q(1) << 8).to_string() }).collect()),
         llama_numerics() as u8,
         kv_q8 as u8,
         include_str!("kernels.cu"),
@@ -621,6 +626,10 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    fn hadamard(&self, x: u64, x_stride: usize, out: u64, out_stride: usize, signs: u64, n: usize, rows: usize) -> anyhow::Result<()> {
+        launch!(self, "hadamard", cfg((n as u32 / 128, rows as u32), 128, 0), x, x_stride as i32, out, out_stride as i32, signs);
+        Ok(())
+    }
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()> {
         launch!(self, "swiglu", Self::grid(n), g, u, n as i32);
         Ok(())

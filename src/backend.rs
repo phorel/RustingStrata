@@ -199,6 +199,11 @@ pub trait Backend: Send {
     }
     /// x += y.
     fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
+    /// out[r] = H_128 (signs ⊙ x[r]) for `rows` rows of `n` floats (row r at x + 4 r x_stride bytes, out likewise; in
+    /// place when out == x): the rotation of the input of a Gyro tensor (`quant::tq::Rot::rotate`, block 128).
+    fn hadamard(&self, _x: u64, _x_stride: usize, _out: u64, _out_stride: usize, _signs: u64, _n: usize, _rows: usize) -> anyhow::Result<()> {
+        anyhow::bail!("the {} backend has no Hadamard rotation", self.name())
+    }
     /// g = silu(g) * u.
     fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
     /// The SwiGLU of `rows` rows of n for a GEMV with quantized weights: either g = silu(g) * u (returns 0), or
