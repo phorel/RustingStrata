@@ -9,6 +9,35 @@ work, and the expert placement adapts to the routing it sees.
 Status: v1.2.0. Milestones M0-M6 are done (M6: server, chat, calibration, bench); the v1 gate run is in
 `docs/m6-results.md`.
 
+## This fork
+
+Forked from [RustingStudio/RustingStrata](https://github.com/RustingStudio/RustingStrata) at commit `95964da`
+(2026-11-07) to run on an RTX 2060 SUPER 8 GB with a Ryzen 5 3600 and 32 GB of RAM. Upstream has moved on since (813
+commits by 2026-11-11) and none of that is merged here. The numbers below are from that machine; the tables in
+[Numbers](#numbers) are upstream's, from its RTX 3060 reference machine.
+
+| Change | What it does | Measured here |
+|---|---|---|
+| CUDA on Turing (sm_75) | The kernels compile and run on RTX 20 cards: warp reductions by shuffles, tensor-core multiplies in Turing's shapes, a synchronous fallback for `cp.async`, shared memory within 64 KB. | |
+| `serve`: `developer` role | The OpenAI `developer` role is taken as `system`. | |
+| `serve`: `GET /props` | The llama-server fields that clients read. | |
+| `serve`: `--default-think` | Thinking on when a request does not say; a request that sets `enable_thinking` still wins. | |
+| Integer Q5_K CPU kernel | Q5_K experts on the CPU no longer go through the f32 fallback (the down experts of Q4_K_M files). | 35B-A3B Q4_K_M: 29 to 57 tok/s decode. |
+| `--ngram [N]` | Drafts from repeated text: when the last N tokens occurred earlier in the context, the 3 tokens that followed are verified in one forward. Output is unchanged. | 35B-A3B Q4_K_S, file rewrite: 48-52 to 72-74 tok/s; text with no repeats: 49-51 to 44-47. |
+| Integer IQ4_NL CPU kernel | The same for IQ4_NL experts (the down experts of half the layers of Qwen3.8-Flash-Next UD-IQ2_XS, every expert of IQ4_NL files). | Flash-Next UD-IQ2_XS: 7.5-7.9 to 9.8-11.3 tok/s decode. |
+| Gyro files | The trellis types TQ2_T, TQK4-TQK7 and TQP5-TQP7 and the Hadamard rotation of agentionai's Gyro quants of Qwen3.8-Flash-Next: CPU reference, integer CPU kernels, CUDA decode and batched prefill. On Vulkan, and for TQP (Gyro-L), the experts run on the CPU and the prompt goes token by token. A `-noPLE` file does not load (no option to take the n-gram table from another file). | Gyro-S: 11-15 tok/s decode, 208-222 tok/s on a 1737-token prompt. |
+
+Qwen3.8-Flash-Next on this machine, `--ctx 8192 --chunk 512 --vram-margin 256` (the default chunk of 4096 leaves this
+model's experts almost no VRAM on 8 GB):
+
+| File | Weights without the n-gram table | Decode | Prefill, 4096 tokens |
+|---|---|---|---|
+| unsloth UD-IQ2_XS | 43.8 GB | 10-14 tok/s | 181 tok/s (before the IQ4_NL kernel) |
+| unsloth UD-IQ1_M | 36.5 GB | 15-20 tok/s | 281 tok/s |
+| agentionai Gyro-S | 25.8 GB of experts | 11-15 tok/s (`bench`: 18-21) | 319 tok/s |
+
+None of these fit in RAM and VRAM together with room to spare, so decode speed moves with what the page cache holds.
+
 ## Numbers
 
 Reference machine: RTX 3060 12 GB, Ryzen 5 7600X, 32 GB RAM. Model: `Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` (11.7 GiB,
